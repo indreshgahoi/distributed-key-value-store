@@ -162,3 +162,87 @@ If a client runs `Get("Ram", readTS = 150)`:
    - Is the timestamp $\le 150$? Yes ($100 \le 150$).
    - Is it a tombstone? No (`OpTypePut`).
 6. Return ₹100. Versions 200 and 300 were skipped automatically.
+
+### Watermark-Based Compaction & Garbage Collection (GC)
+
+#### 1. Why Do We Need Compaction? (The Storage Leak Problem)
+
+Because MVCC guarantees that writes never overwrite or delete data in place, physical memory and disk usage only ever grow.
+
+Without a cleanup mechanism:
+1. **Unbounded Space Growth:** Updating an account balance 1,000 times writes 1,000 separate version records to storage.
+2. **Degraded Read Performance:** Range scans have to physically step over thousands of dead historical versions and tombstone markers just to find the current active values.
+
+However, we **cannot simply delete older versions as soon as a new version arrives**. A background analytical audit, a backup job, or a distributed transaction might currently be running an isolated read at an older snapshot timestamp.
+
+Compaction must be mathematically safe: **reclaim space without violating snapshot isolation for any running transaction**.
+
+---
+
+#### 2. The Core Compaction Invariant: The "Safe Watermark"
+
+Let $T_{\text{watermark}}$ be the **Safe Watermark Timestamp** — the oldest snapshot timestamp among all active, open read transactions across the cluster.
+
+$$\text{Active Snapshot Window} = [T_{\text{watermark}}, +\infty)$$
+
+Any read that ever executes in the system now or in the future will read at some timestamp $T_{\text{read}} \ge T_{\text{watermark}}$.
+
+```text
+Historical Timeline for User Key "account:Ram":
+====================================================================================>
+Version:       V1(T=50)        V2(T=100)      |      V3(T=200)        V4(T=300)
+Payload:       Put ₹50         Put ₹100       |      Put ₹200         Delete (Tombstone)
+                                              |
+                                     Safe Watermark = 150
+```
+
+For every user key, whose versions sort newest-to-oldest, compaction evaluates versions against three strict rules:
+
+##### Rule 1: Versions Above Watermark ($T > T_{\text{watermark}}$) $\to$ RETAIN
+- **Action:** Keep all versions completely untouched.
+- **Why:** An active transaction may currently be reading at snapshot $T_{\text{read}} = 250$. It must be able to see $V_3$ (TS 200) while remaining isolated from $V_4$ (TS 300).
+
+##### Rule 2: First Version Encountered Below Watermark ($T \le T_{\text{watermark}}$) $\to$ RETAIN AS BASELINE
+- **Action:** Retain this single version.
+- **Why:** Any transaction reading at or after $T_{\text{watermark}}$ that has not found a newer version above the watermark will fall back to this record. It is the definitive "baseline" state of the key at the watermark horizon.
+- **Tombstone case:** If this baseline version is an `OpTypeDelete` (tombstone) and no transactions exist behind it, the key is logically dead for all time. The tombstone itself is scheduled for eviction, same as Rule 3.
+
+##### Rule 3: Subsequent Versions Below Watermark ($T < T_{\text{baseline}}$) $\to$ PURGE
+- **Action:** Overwrite the physical entry so it is treated as gone.
+- **Why:** Because $V_2$ ($T=100$) satisfies all queries at or above $T_{\text{watermark}} = 150$, older version $V_1$ ($T=50$) is permanently shadowed. No active or future transaction can ever legally observe it.
+
+#### 3. Execution Mechanics: How Compaction Traverses Storage
+
+Compaction runs as an offline or background worker that coordinates across all three layers:
+
+```text
+[ Layer 2: Compactor ]
+        │
+        ├── 1. Seek to start of range: Seek([startKey, ^MaxUint64])
+        ├── 2. Iterate using Layer 0 Iterator
+        │
+        ├── 3. For each physical key:
+        │         Decodes (userKey, versionTS) via Layer 1 Codec
+        │
+        ├── 4. Tracks:
+        │         - Current userKey boundary
+        │         - Encountered baseline <= T_watermark (Boolean flag)
+        │
+        └── 5. Purges shadowed versions:
+                  raw.Put(physicalKey, EncodeValueAppend(nil, OpTypeDelete, nil))
+```
+
+Purging overwrites the shadowed entry with a valid, self-describing tombstone rather than calling `raw.Delete` directly. Layer 0 has no true physical removal — its `Delete` just writes a 0-byte value — so a later `Get`/`Scan` landing on that exact physical key would fail to decode it. Writing an explicit `OpTypeDelete` keeps the slot decodable and correctly invisible to readers, at the cost of not actually reclaiming Layer 0's arena space (a known Layer 0 limitation, independent of this compaction pass).
+
+#### 4. Worked Example: Compaction Decisions for `account:Ram`
+
+```text
++---------------------------------------------------------------------------------+
+| Physical Entry             | Decision       | Reason                            |
++---------------------------------------------------------------------------------+
+| [Ram, ^300, OpDelete]      | KEEP           | TS 300 > Watermark (150)          |
+| [Ram, ^200, OpPut(₹200)]   | KEEP           | TS 200 > Watermark (150)          |
+| [Ram, ^100, OpPut(₹100)]   | KEEP (Baseline)| First version <= Watermark (150)  |
+| [Ram, ^50,  OpPut(₹50)]    | PURGE          | Shadowed by TS 100 below watermark|
++---------------------------------------------------------------------------------+
+```

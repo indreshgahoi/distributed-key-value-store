@@ -4,7 +4,7 @@ Building a distributed transactional key-value database from scratch can feel da
 
 | # | Milestone | Status |
 |---|---|---|
-| 1 | Local MVCC Storage Engine (Single Node) | 🚧 In progress |
+| 1 | Local MVCC Storage Engine (Single Node) | ✅ Done |
 | 2 | Single Group Raft Consensus | ⬜ Not started |
 | 3 | Multi-Raft and Range Sharding | ⬜ Not started |
 | 4 | Hybrid Logical Clock (HLC) | ⬜ Not started |

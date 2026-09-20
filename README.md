@@ -29,7 +29,7 @@ Full roadmap notes: [docs/milestones.md](docs/milestones.md).
   - [x] `Put` / `Delete` — versioned writes via Layer 1 encoding
   - [x] `Get` — snapshot point-read, tombstone-aware, resolves newest version at or before `readTS`
   - [x] `Scan` — snapshot range scan, deduplicates shadowed versions, skips tombstones
-  - [ ] `GC` — watermark-based compaction of old versions
+  - [x] `CompactBelowWatermark` — watermark-based GC that purges versions shadowed below a safe read timestamp
 
 Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
 
@@ -55,7 +55,9 @@ distributed-key-value-store/
 │   │   └── mvcc/                  # ✅ Layer 2: MVCC protocol & snapshot engine
 │   │       ├── engine.go          # ✅ MVCCStore interface, KeyValue, sentinel errors
 │   │       ├── mvcc.go            # ✅ Put/Delete/Get/Scan over Layer 0 + Layer 1
-│   │       └── mvcc_test.go       # ✅ Isolation, tombstone, and scan-dedup tests + benchmark
+│   │       ├── mvcc_test.go       # ✅ Isolation, tombstone, and scan-dedup tests + benchmark
+│   │       ├── gc.go              # ✅ Watermark-based compaction (CompactBelowWatermark)
+│   │       └── gc_test.go         # ✅ Compaction correctness test
 │   │
 │   └── common/                    # planned
 │       └── errors.go              # Domain-specific errors (KeyNotFound, StaleWrite)
