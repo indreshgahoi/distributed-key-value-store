@@ -89,11 +89,3 @@ go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -run='^$' -v ./pkg/st
 Benchmark baselines are committed under [bench/](bench/) so throughput and allocation counts can be diffed across commits with `benchstat` instead of relying on memory. See [bench/README.md](bench/README.md) for how to update a baseline and compare it against history.
 
 Current read-path baseline: 0 B/op, 0 allocs/op for concurrent `Get` — see [bench/BenchmarkSkipList_ConcurrentReads.txt](bench/BenchmarkSkipList_ConcurrentReads.txt).
-
-## Known issues
-
-Tracked transparently as they're found through testing:
-
-- [x] **Fixed** — torn read on concurrent value updates: `Get` and the iterator's `Value()` now use `atomic.LoadUint32` on `valOffset`/`valLen`, matching the writer's atomic stores. Caught by `-race` in `TestSkipList_ConcurrentRaceContention`.
-- [ ] **Open** — `Put`'s node-linking loop writes a newly inserted node's forward pointers to a Go-heap copy instead of the arena-resident node, which truncates list traversal after the first insert. Reproduces via `TestSkipList_TotalLexicographicalOrder`.
-- [ ] **Open** — `Arena.alloc` panics instead of returning an error when the arena is exhausted, and there's no compaction/flush strategy yet to bound memtable size. Reproduces under sustained concurrent writes in `TestSkipList_ConcurrentRaceContention` (without `-race`).
