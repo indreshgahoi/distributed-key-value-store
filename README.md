@@ -21,7 +21,10 @@ Full roadmap notes: [docs/milestones.md](docs/milestones.md).
   - [x] `Put` / `Get` / `Delete` / `Iterator` (`Seek`, `First`, `Next`)
   - [x] Lock-free concurrent writes via CAS retry loops
   - [ ] On-disk backend
-- [ ] **Layer 1 — Binary encoding & serialization** (`pkg/storage/codec`): memcmp-safe key escaping, timestamp packing
+- [x] **Layer 1 — Binary encoding & serialization** (`pkg/storage/codec`): memcmp-safe key escaping, inverted-timestamp packing
+  - [x] `EncodeKeyAppend` / `DecodeKey` — zero-collision key escaping + bit-inverted timestamp for descending version order
+  - [x] `EncodeValueAppend` / `DecodeValue` — OpType header (Put/Delete) + zero-copy value payload
+  - [x] Zero-allocation hot path via caller-supplied buffers
 - [ ] **Layer 2 — MVCC protocol & snapshot engine** (`pkg/storage/mvcc`): versioned Put, tombstone Delete, snapshot reads, GC
 
 Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
@@ -40,11 +43,10 @@ distributed-key-value-store/
 │   │   │   ├── skiplist.go        # ✅ Lock-free concurrent skip list + arena allocator
 │   │   │   └── skiplist_test.go   # ✅ Unit, ordering, seek, and concurrency/race tests
 │   │   │
-│   │   ├── codec/                 # planned: Layer 1 binary encoding & serialization
-│   │   │   ├── key.go             # Memcmp-safe key escaping, ^ts packing
-│   │   │   ├── key_test.go
-│   │   │   ├── value.go           # Value encoding (OpType headers, payloads)
-│   │   │   └── value_test.go
+│   │   ├── codec/                 # ✅ Layer 1: binary encoding & serialization
+│   │   │   ├── key.go             # ✅ Memcmp-safe key escaping, ^ts packing
+│   │   │   ├── value.go           # ✅ Value encoding (OpType headers, payloads)
+│   │   │   └── codec_test.go      # ✅ Ordering invariants, round-trip, benchmark
 │   │   │
 │   │   └── mvcc/                  # planned: Layer 2 MVCC protocol & snapshot engine
 │   │       ├── engine.go          # MVCC interface (Put, Get, Delete, Scan)
@@ -75,17 +77,21 @@ go build ./...
 
 ```bash
 # Full unit test suite, verbose
-go test -v ./pkg/storage/raw/...
+go test -v ./...
 
 # Race detector — verifies thread-safety under concurrent load
 go test -race -run TestSkipList_ConcurrentRaceContention -v ./pkg/storage/raw/...
 
-# Benchmark: concurrent read throughput and allocations
+# Benchmarks: throughput and allocations
 go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -run='^$' -v ./pkg/storage/raw/...
+go test -bench=BenchmarkCodec_ZeroAllocEncode -benchmem -run='^$' -v ./pkg/storage/codec/...
 ```
 
 ## Benchmarks
 
 Benchmark baselines are committed under [bench/](bench/) so throughput and allocation counts can be diffed across commits with `benchstat` instead of relying on memory. See [bench/README.md](bench/README.md) for how to update a baseline and compare it against history.
 
-Current read-path baseline: 0 B/op, 0 allocs/op for concurrent `Get` — see [bench/BenchmarkSkipList_ConcurrentReads.txt](bench/BenchmarkSkipList_ConcurrentReads.txt).
+| Layer | Baseline | Detail |
+|---|---|---|
+| 0 — `raw` | 0 B/op, 0 allocs/op (concurrent `Get`) | [bench/BenchmarkSkipList_ConcurrentReads.txt](bench/BenchmarkSkipList_ConcurrentReads.txt) |
+| 1 — `codec` | 0 B/op, 0 allocs/op (`EncodeKeyAppend` with reused buffer) | [bench/BenchmarkCodec_ZeroAllocEncode.txt](bench/BenchmarkCodec_ZeroAllocEncode.txt) |

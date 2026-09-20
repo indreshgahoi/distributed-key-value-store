@@ -4,10 +4,16 @@ This directory holds committed benchmark baselines so read/write performance can
 
 ## Updating a baseline
 
-Run with `-count=5` (or more) so the output carries enough samples for statistical comparison, and pipe straight into the tracked file:
+Run with `-count=5` (or more) so the output carries enough samples for statistical comparison, and pipe straight into the tracked file named after the benchmark:
 
 ```bash
+go test -bench=<BenchmarkName> -benchmem -count=5 -run='^$' ./pkg/<package>/... | tee bench/<BenchmarkName>.txt
+```
+
+e.g.:
+```bash
 go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -count=5 -run='^$' ./pkg/storage/raw/... | tee bench/BenchmarkSkipList_ConcurrentReads.txt
+go test -bench=BenchmarkCodec_ZeroAllocEncode -benchmem -count=5 -run='^$' ./pkg/storage/codec/... | tee bench/BenchmarkCodec_ZeroAllocEncode.txt
 ```
 
 Commit the updated file alongside the code change that motivated it, so the two land together in history.
@@ -20,8 +26,8 @@ Commit the updated file alongside the code change that motivated it, so the two 
 go install golang.org/x/perf/cmd/benchstat@latest
 
 # baseline = last commit's numbers, current = your working tree
-git show HEAD:bench/BenchmarkSkipList_ConcurrentReads.txt > /tmp/baseline.txt
-go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -count=5 -run='^$' ./pkg/storage/raw/... > /tmp/current.txt
+git show HEAD:bench/<BenchmarkName>.txt > /tmp/baseline.txt
+go test -bench=<BenchmarkName> -benchmem -count=5 -run='^$' ./pkg/<package>/... > /tmp/current.txt
 
 benchstat /tmp/baseline.txt /tmp/current.txt
 ```
@@ -29,8 +35,8 @@ benchstat /tmp/baseline.txt /tmp/current.txt
 Or compare any two historical points directly:
 
 ```bash
-git show <old-sha>:bench/BenchmarkSkipList_ConcurrentReads.txt > /tmp/old.txt
-git show <new-sha>:bench/BenchmarkSkipList_ConcurrentReads.txt > /tmp/new.txt
+git show <old-sha>:bench/<BenchmarkName>.txt > /tmp/old.txt
+git show <new-sha>:bench/<BenchmarkName>.txt > /tmp/new.txt
 benchstat /tmp/old.txt /tmp/new.txt
 ```
 
@@ -38,6 +44,9 @@ benchstat /tmp/old.txt /tmp/new.txt
 
 | File | Benchmark | Covers |
 |---|---|---|
-| [`BenchmarkSkipList_ConcurrentReads.txt`](BenchmarkSkipList_ConcurrentReads.txt) | `BenchmarkSkipList_ConcurrentReads` | Concurrent `Get` throughput and allocations under `GOMAXPROCS` parallel readers |
+| [`BenchmarkSkipList_ConcurrentReads.txt`](BenchmarkSkipList_ConcurrentReads.txt) | `BenchmarkSkipList_ConcurrentReads` | Concurrent `Get` throughput and allocations under `GOMAXPROCS` parallel readers (Layer 0) |
+| [`BenchmarkCodec_ZeroAllocEncode.txt`](BenchmarkCodec_ZeroAllocEncode.txt) | `BenchmarkCodec_ZeroAllocEncode` | `EncodeKeyAppend` throughput and allocations when reusing a pre-sized buffer (Layer 1) |
 
-Note: `Get` returns a slice pointing directly into the arena's backing array (no per-call copy — that's what makes 0 allocs/op possible). Callers that need to retain a value past a subsequent write to that key must copy it themselves; the zero-allocation guarantee is a property of the read path, not a promise that the returned bytes are immutable forever.
+Notes:
+- `SkipListEngine.Get` returns a slice pointing directly into the arena's backing array (no per-call copy — that's what makes 0 allocs/op possible). Callers that need to retain a value past a subsequent write to that key must copy it themselves; the zero-allocation guarantee is a property of the read path, not a promise that the returned bytes are immutable forever.
+- `EncodeKeyAppend`'s 0 allocs/op depends on the caller reusing a buffer sized via `EncodedKeyLen` and re-slicing it (`buf[:0]`) between calls, as the benchmark does — passing `nil` or an undersized `dst` will allocate.
