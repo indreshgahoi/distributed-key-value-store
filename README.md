@@ -84,6 +84,12 @@ go test -race -run TestSkipList_ConcurrentRaceContention -v ./pkg/storage/raw/..
 go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -run='^$' -v ./pkg/storage/raw/...
 ```
 
+## Benchmarks
+
+Benchmark baselines are committed under [bench/](bench/) so throughput and allocation counts can be diffed across commits with `benchstat` instead of relying on memory. See [bench/README.md](bench/README.md) for how to update a baseline and compare it against history.
+
+Current read-path baseline: 0 B/op, 0 allocs/op for concurrent `Get` — see [bench/BenchmarkSkipList_ConcurrentReads.txt](bench/BenchmarkSkipList_ConcurrentReads.txt).
+
 ## Known issues
 
 Tracked transparently as they're found through testing:
