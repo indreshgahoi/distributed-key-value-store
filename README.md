@@ -6,7 +6,7 @@ A distributed, transactional key-value database built from scratch in Go, layer 
 
 | # | Milestone | Status |
 |---|---|---|
-| 1 | Local MVCC Storage Engine (Single Node) | 🚧 In progress |
+| 1 | Local MVCC Storage Engine (Single Node) | ✅ Done |
 | 2 | Single Group Raft Consensus | ⬜ Not started |
 | 3 | Multi-Raft and Range Sharding | ⬜ Not started |
 | 4 | Hybrid Logical Clock (HLC) | ⬜ Not started |
@@ -25,7 +25,11 @@ Full roadmap notes: [docs/milestones.md](docs/milestones.md).
   - [x] `EncodeKeyAppend` / `DecodeKey` — zero-collision key escaping + bit-inverted timestamp for descending version order
   - [x] `EncodeValueAppend` / `DecodeValue` — OpType header (Put/Delete) + zero-copy value payload
   - [x] Zero-allocation hot path via caller-supplied buffers
-- [ ] **Layer 2 — MVCC protocol & snapshot engine** (`pkg/storage/mvcc`): versioned Put, tombstone Delete, snapshot reads, GC
+- [x] **Layer 2 — MVCC protocol & snapshot engine** (`pkg/storage/mvcc`): versioned Put, tombstone Delete, snapshot reads
+  - [x] `Put` / `Delete` — versioned writes via Layer 1 encoding
+  - [x] `Get` — snapshot point-read, tombstone-aware, resolves newest version at or before `readTS`
+  - [x] `Scan` — snapshot range scan, deduplicates shadowed versions, skips tombstones
+  - [ ] `GC` — watermark-based compaction of old versions
 
 Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
 
@@ -48,12 +52,10 @@ distributed-key-value-store/
 │   │   │   ├── value.go           # ✅ Value encoding (OpType headers, payloads)
 │   │   │   └── codec_test.go      # ✅ Ordering invariants, round-trip, benchmark
 │   │   │
-│   │   └── mvcc/                  # planned: Layer 2 MVCC protocol & snapshot engine
-│   │       ├── engine.go          # MVCC interface (Put, Get, Delete, Scan)
-│   │       ├── reader.go          # Snapshot iterator & point-get implementation
-│   │       ├── writer.go          # Versioned Put, tombstone Delete, WriteBatch
-│   │       ├── gc.go              # Watermark-based compaction & garbage collection
-│   │       └── mvcc_test.go
+│   │   └── mvcc/                  # ✅ Layer 2: MVCC protocol & snapshot engine
+│   │       ├── engine.go          # ✅ MVCCStore interface, KeyValue, sentinel errors
+│   │       ├── mvcc.go            # ✅ Put/Delete/Get/Scan over Layer 0 + Layer 1
+│   │       └── mvcc_test.go       # ✅ Isolation, tombstone, and scan-dedup tests + benchmark
 │   │
 │   └── common/                    # planned
 │       └── errors.go              # Domain-specific errors (KeyNotFound, StaleWrite)
@@ -79,12 +81,13 @@ go build ./...
 # Full unit test suite, verbose
 go test -v ./...
 
-# Race detector — verifies thread-safety under concurrent load
-go test -race -run TestSkipList_ConcurrentRaceContention -v ./pkg/storage/raw/...
+# Race detector across all packages
+go test -race ./...
 
 # Benchmarks: throughput and allocations
 go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -run='^$' -v ./pkg/storage/raw/...
 go test -bench=BenchmarkCodec_ZeroAllocEncode -benchmem -run='^$' -v ./pkg/storage/codec/...
+go test -bench=BenchmarkMVCC_SnapshotPointGet -benchmem -run='^$' -v ./pkg/storage/mvcc/...
 ```
 
 ## Benchmarks
@@ -95,3 +98,6 @@ Benchmark baselines are committed under [bench/](bench/) so throughput and alloc
 |---|---|---|
 | 0 — `raw` | 0 B/op, 0 allocs/op (concurrent `Get`) | [bench/BenchmarkSkipList_ConcurrentReads.txt](bench/BenchmarkSkipList_ConcurrentReads.txt) |
 | 1 — `codec` | 0 B/op, 0 allocs/op (`EncodeKeyAppend` with reused buffer) | [bench/BenchmarkCodec_ZeroAllocEncode.txt](bench/BenchmarkCodec_ZeroAllocEncode.txt) |
+| 2 — `mvcc` | ~200 ns/op, 96 B/op, 4 allocs/op (snapshot `Get` resolving the newest of 10 versions) | [bench/BenchmarkMVCC_SnapshotPointGet.txt](bench/BenchmarkMVCC_SnapshotPointGet.txt) |
+
+Layer 2's `Get` isn't zero-allocation like the layers below it — it allocates a seek-key buffer, a key-decode scratch buffer, and clones the returned payload to protect the caller from the storage engine's internal memory. That's expected at this layer, not a regression.

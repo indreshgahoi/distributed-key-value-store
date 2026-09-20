@@ -46,7 +46,9 @@ benchstat /tmp/old.txt /tmp/new.txt
 |---|---|---|
 | [`BenchmarkSkipList_ConcurrentReads.txt`](BenchmarkSkipList_ConcurrentReads.txt) | `BenchmarkSkipList_ConcurrentReads` | Concurrent `Get` throughput and allocations under `GOMAXPROCS` parallel readers (Layer 0) |
 | [`BenchmarkCodec_ZeroAllocEncode.txt`](BenchmarkCodec_ZeroAllocEncode.txt) | `BenchmarkCodec_ZeroAllocEncode` | `EncodeKeyAppend` throughput and allocations when reusing a pre-sized buffer (Layer 1) |
+| [`BenchmarkMVCC_SnapshotPointGet.txt`](BenchmarkMVCC_SnapshotPointGet.txt) | `BenchmarkMVCC_SnapshotPointGet` | Snapshot `Get` throughput and allocations, resolving the newest of 10 stored versions (Layer 2) |
 
 Notes:
 - `SkipListEngine.Get` returns a slice pointing directly into the arena's backing array (no per-call copy — that's what makes 0 allocs/op possible). Callers that need to retain a value past a subsequent write to that key must copy it themselves; the zero-allocation guarantee is a property of the read path, not a promise that the returned bytes are immutable forever.
 - `EncodeKeyAppend`'s 0 allocs/op depends on the caller reusing a buffer sized via `EncodedKeyLen` and re-slicing it (`buf[:0]`) between calls, as the benchmark does — passing `nil` or an undersized `dst` will allocate.
+- `mvcc.Store.Get` is not zero-allocation: it allocates a fresh seek-key buffer per call, a key-decode scratch buffer, and clones the returned payload via `slices.Clone` before handing it back to the caller (so the caller never holds a reference into Layer 0's internal arena). The 4 allocs/op baseline reflects that by design, not a bug to fix.

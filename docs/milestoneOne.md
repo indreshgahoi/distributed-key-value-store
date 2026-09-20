@@ -113,3 +113,52 @@ Encoded Physical Value:
    $$\forall t_1 < t_2: \text{EncodeKey}(k, t_2) < \text{EncodeKey}(k, t_1)$$
 3. **Zero-Allocation Hot Path**
    All encoding and decoding APIs accept pre-allocated destination buffers (`dst []byte`), allowing callers in Layer 2 to eliminate heap allocations via stack buffers or `sync.Pool`.
+
+## Layer 2: MVCC Protocol & Snapshot Engine
+
+At Layer 2, we enforce a strict rule: data is never modified or erased in place. Every write or delete creates an immutable, timestamped record.
+
+- A read at timestamp $T_{\text{read}}$ sees the database frozen in time: it returns the newest version whose timestamp $T_{\text{version}} \le T_{\text{read}}$.
+- Versions written with $T_{\text{version}} > T_{\text{read}}$ are completely invisible to that reader.
+
+How the components fit together:
+```text
++-------------------------------------------------------------------------+
+|                              Layer 2: MVCC                              |
+|   Get(key, readTS)    Put(key, val, commitTS)    Delete(key, commitTS)   |
+|   Scan(start, end, readTS)                       GC(safeWatermarkTS)    |
++-------------------------------------------------------------------------+
+       │                             │                             │
+       │ Encodes physical key        │ Checks OpType               │ Traverses
+       ▼                             ▼                             ▼
++---------------------+       +---------------------+       +-------------+
+|   Layer 1: Codec    |       |   OpTypePut (1)     |       | Layer 0:    |
+|   EncodeKeyAppend   |       |   OpTypeDelete (2)  |       | ByteEngine  |
+|   DecodeKey         |       |   (Tombstone)       |       | (SkipList)  |
++---------------------+       +---------------------+       +-------------+
+```
+
+#### Step-by-Step Point Read Execution: `Get(key, readTS)`
+
+Suppose our storage engine holds three versions of key `"Ram"`:
+- `"Ram"` @ TS 300 $\to$ Value: ₹200
+- `"Ram"` @ TS 200 $\to$ Value: Tombstone (`OpTypeDelete`)
+- `"Ram"` @ TS 100 $\to$ Value: ₹100
+
+Because Layer 1 bit-inverts timestamps (`^ts`), Layer 0 physically orders them:
+
+```text
+[Ram, ^300] < [Ram, ^200] < [Ram, ^100]
+```
+
+If a client runs `Get("Ram", readTS = 150)`:
+
+1. Layer 2 constructs the seek key: `seekKey = EncodeKeyAppend(nil, "Ram", 150)` (which contains `^150`).
+2. Because `300 > 150`, `^300 < ^150` — so `[Ram, ^300]` sorts before our seek target in the skip list.
+3. Because `200 > 150`, `^200 < ^150` — so `[Ram, ^200]` also sorts before our seek target.
+4. Calling `iter.Seek(seekKey)` lands directly on `[Ram, ^100]` in $O(\log N)$ time.
+5. We inspect the record:
+   - Is the user key still `"Ram"`? Yes.
+   - Is the timestamp $\le 150$? Yes ($100 \le 150$).
+   - Is it a tombstone? No (`OpTypePut`).
+6. Return ₹100. Versions 200 and 300 were skipped automatically.
