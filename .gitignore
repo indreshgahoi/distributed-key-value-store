@@ -1,5 +1,6 @@
 # Binaries
 /bin/
+/kv-server
 *.exe
 *.exe~
 *.dll
