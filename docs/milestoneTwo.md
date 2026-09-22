@@ -187,11 +187,26 @@ The tests run against an in-process `SimulatedNetwork` (`raft_test.go`) rather t
 | `TestRaft_LeaderFailureAndFailover` | Disconnecting the Leader triggers a new election with a strictly higher term; new writes continue under the new Leader; on reconnect, the stale Leader adopts the higher term, steps down to Follower, and catches up its log. |
 | `TestRaft_LogConflictTruncation` | An entry written by an isolated (stale) Leader that never reached quorum is correctly overwritten once a legitimately-elected new Leader's conflicting entry replicates — the Log Matching Invariant (§3) in practice. |
 | `TestRaft_ConcurrentProposalsAndRace` | 5 goroutines × 20 concurrent proposals converge to identical log length on every node, clean under `-race`. |
+| `TestRaft_InstallSnapshotToLaggingFollower` | A follower disconnected for 20 leader proposals is reconnected after the leader compacts its log; the leader detects the follower's `nextIndex` is behind the compaction horizon and sends `InstallSnapshot` instead of individual entries, and the follower's MVCC store ends up with the correct state. Verification polls with a timeout rather than a fixed sleep — see note below. |
+| `TestStorage_KVStorage_PersistenceAndTruncation` | `KVStorage` (the `Storage` implementation over Layer 0) persists `HardState` and log entries, correctly truncates conflicting entries on overwrite, and `CreateSnapshot` compacts entries before the watermark so they return `ErrCompacted`. |
+| `TestRaft_PreVoteBlocksTermInflationWhileIsolated` | A node disconnected through 600ms of isolation (several election-timeout cycles) never advances `currentTerm` — `startRealElectionLocked` (the only place `currentTerm++` happens) is only reached after winning a Pre-Vote quorum, which an isolated node can never do. |
+| `TestRaft_PreVoteProtectsStableLeaderOnReconnect` | The same isolation-then-reconnect scenario, but asserting on the *Leader* instead: it stays Leader at the same term throughout, for a full second after the isolated node reconnects. This is the exact scenario that made `TestRaft_InstallSnapshotToLaggingFollower` flaky (see below) — now a dedicated regression test. |
 
-Two benchmarks measure the hot paths directly (`raft_bench_test.go`):
+Six benchmarks measure the hot paths directly (`raft_bench_test.go`, `raft_snapshot_bench_test.go`, `raft_prevote_bench_test.go`):
 - `BenchmarkRaft_LogAppend` — raw in-memory log append, no network involved.
-- `BenchmarkRaft_SequentialProposals` — full propose → quorum replicate → commit → apply latency on a 3-node cluster.
-- `BenchmarkRaft_ConcurrentProposals` — proposal throughput under concurrent write pressure. **Must be run with a fixed `-benchtime` (e.g. `-benchtime=2000x`)** — left to Go's default adaptive scaling, it proposes enough unique keys to exhaust the test cluster's fixed-size Layer 0 arena and panics the whole binary (a known Layer 0 limitation: no reclamation, see [bench/README.md](../bench/README.md)).
+- `BenchmarkRaft_SequentialProposals` — full propose → quorum replicate → commit → apply latency on a 3-node cluster, now including `KVStorage` persistence on every step.
+- `BenchmarkRaft_ConcurrentProposals` — proposal throughput under concurrent write pressure. **Must be run with a fixed `-benchtime` (e.g. `-benchtime=600x`)** — left to Go's default adaptive scaling, it proposes enough unique keys to exhaust the test cluster's fixed-size Layer 0 arena and panics the whole binary (a known Layer 0 limitation: no reclamation, see [bench/README.md](../bench/README.md)). This cap dropped from 2000x to 600x once persistence landed, since every `AppendEntries` now also writes into the raft node's own storage arena on top of the MVCC arena.
+- `BenchmarkMVCC_SnapshotExport` — Layer 2 export throughput streaming 10,000 live keys.
+- `BenchmarkMVCC_SnapshotRestore` — ingestion throughput replaying a 10,000-key snapshot into a fresh store.
+- `BenchmarkRaft_LeaderElection` — time-to-first-leader on a fresh 3-node cluster. None of the other benchmarks touch the election path at all (they measure steady-state proposing after a leader already exists), and Pre-Vote's entire cost is one extra RPC round-trip specifically in that path, so this is the one that actually reflects it. ~95ms/op, dominated by the randomized 60-120ms election timeout itself.
+
+**A note on `TestRaft_InstallSnapshotToLaggingFollower` and Pre-Vote:** this test was flaky (~20% failure rate) until Pre-Vote was implemented (see [§9](#9-the-pre-vote-protocol-raft-96) below) and its final assertion changed from a single fixed sleep-then-check to a poll with a generous timeout. Root cause: while `followerID` was disconnected, it kept timing out and incrementing its own term in isolation — every attempt failed immediately since it couldn't reach anyone, but the term itself kept climbing. The instant it reconnected, if its own election timer fired before it received a heartbeat, it broadcast `RequestVote` at that inflated term, and `HandleRequestVote` adopted any higher term unconditionally — even from a candidate whose short, stale log could never actually win the vote — forcing the healthy, currently-serving Leader to step down right as it was supposed to be delivering the snapshot.
+
+Implementing Pre-Vote fixed this at the root (see `TestRaft_PreVoteBlocksTermInflationWhileIsolated`/`TestRaft_PreVoteProtectsStableLeaderOnReconnect` above), but two bugs surfaced while validating it, both in the leader-stickiness check `HandleRequestVote` uses to reject Pre-Votes from a node that hasn't proven it can reach a quorum:
+1. **`rn.lastHeartBeat` was written once, at construction, and never updated.** A follower's stickiness window was therefore only real for the first `ElectionTimeoutMin` after the process started — after that, `time.Since(rn.lastHeartBeat)` only grew, so the check was permanently `false` regardless of how recently a real heartbeat had actually arrived. Fixed by updating `rn.lastHeartBeat` inside `HandleAppendEntries` whenever a legitimate heartbeat is processed.
+2. **A Leader never receives `AppendEntries`** (it only sends them), so fix #1 alone didn't help the Leader's own copy of `lastHeartBeat` — it stayed frozen at construction time for as long as the node led, meaning the Leader itself would eventually grant a Pre-Vote to its own challenger. Fixed by treating `rn.role == RoleLeader` as inherently active in the stickiness check — a functioning Leader doesn't need a timer to know it's active.
+
+Both were caught empirically: `TestRaft_PreVoteProtectsStableLeaderOnReconnect` failed ~12% of the time before fix #2 (25-run and 40-run samples), and 0/40 after.
 
 ### Running locally
 
@@ -205,7 +220,10 @@ go test -race ./pkg/consensus/raft/...
 # Benchmarks
 go test -bench=BenchmarkRaft_LogAppend -benchmem -run='^$' ./pkg/consensus/raft/...
 go test -bench=BenchmarkRaft_SequentialProposals -benchmem -run='^$' ./pkg/consensus/raft/...
-go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=2000x -run='^$' ./pkg/consensus/raft/...
+go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=600x -run='^$' ./pkg/consensus/raft/...
+go test -bench=BenchmarkMVCC_SnapshotExport -benchmem -run='^$' ./pkg/consensus/raft/...
+go test -bench=BenchmarkMVCC_SnapshotRestore -benchmem -run='^$' ./pkg/consensus/raft/...
+go test -bench=BenchmarkRaft_LeaderElection -benchmem -run='^$' ./pkg/consensus/raft/...
 ```
 
 To see the consensus engine running for real rather than under simulation, build the `kv-server` daemon and run a live 3-node cluster on localhost — see [README: Run KV Server](../README.md#run-kv-server) for the exact commands and a `/status` polling loop to watch leader election and term convergence happen live.
@@ -219,3 +237,189 @@ For a scripted version of that walkthrough, run [`test_cluster.sh`](../test_clus
 It builds `kv-server`, boots a real 3-node cluster over actual TCP/HTTP (not the `SimulatedNetwork` the tests above use), and checks leader election, write replication across all three nodes, and that a follower correctly redirects writes with HTTP 307 — cleaning up all processes on exit regardless of pass/fail. See [README: Automated cluster smoke test](../README.md#automated-cluster-smoke-test) for what each of its four checks does.
 
 This category of test matters specifically because it's the only one exercising the real transport layer: the `--peers` address-parsing bug once present in `main.go` (storing the wrong split segment as each peer's address) was invisible to the in-process `SimulatedNetwork` tests above, since those never touch `TCPTransport`, `net/rpc`, or flag parsing at all.
+## 7. Storage Durability & Log Persistence
+
+### Why In-Memory Consensus Is Unsafe
+In the baseline Raft engine, state (`currentTerm`, `votedFor`, `log[]`) lives purely in volatile memory. If a node crashes and reboots:  
+
+1. **Term Amnesia:** It resets `currentTerm` to 0.
+2. **Double-Voting Bug (Election Safety Violation):** If Node 1 voted for Node 2 in Term 5, crashes, restarts with `votedFor = 0`, and receives a vote request from Node 3 in Term 5, it will vote a second time in the same term. This can lead to **two leaders being elected in the exact same term**, violating the core safety property of Raft.
+
+```text
+CRASH WITHOUT PERSISTENCE:
+Node 1 votes for Node 2 in Term 5 ──────► Node 1 crashes
+                                              │ reboots with votedFor = 0
+Node 1 votes for Node 3 in Term 5 ◄────── Node 1 receives vote request
+────────────────────────────────────────────────────────────────────────
+RESULT: Both Node 2 and Node 3 achieve majority! TWO LEADERS IN TERM 5!
+```
+The Persistence Invariant (Raft §5.2)  
+Before a node responds to any RequestVote or AppendEntries RPC, it must atomically flush three fields to stable storage:  
+
+```go
+currentTerm: Latest term this server has observed.
+
+votedFor: Candidate ID that received this server's vote in the current term.
+
+log[]: Log entries (command, index, and term).
+```
+
+### The Pluggable Storage Pattern (CockroachDB / Pebble Model)  
+Rather than writing custom file serialization that rewrites the entire log on every mutation ($O(N)$ disk write amplification), we use a pluggable Storage interface. The intent, matching CockroachDB/Pebble, is for Raft state to live directly inside an embedded LSM engine using key prefixes: 
+
+HardState: !raft:hs -> {Term, Vote, Commit}  
+Log Entries: !raft:log:<BigEndianIndex> -> Serialized LogEntry  
+Snapshot Horizon: !raft:snap -> SnapshotMeta
+
+**Current state — this is not yet durable.** `KVStorage` implements that key-prefix scheme correctly, but the `raw.ByteEngine` it's built on is Layer 0's `SkipListEngine`, which is entirely in-memory (`Arena.buf` is a plain `make([]byte, capacity)` — no file, no mmap, nothing reaches disk). The backend-comparison diagram below shows "KVStorage (Pebble)" as the target design; the actual backend in use today is the in-memory skip list, not Pebble. Concretely: `Save()` is called at every point §5.2 requires, so the *protocol* is followed correctly within a process's lifetime — but if the process dies, everything `Save()` ever wrote dies with it. `InitialState()` returns `Term=0, Vote=0` on every restart, not "whatever it was before." Layer 0 gaining a real on-disk backend (the `pebble.go` in the original package layout, never built — see the Layer 0 checklist in the [README](../README.md)) is a prerequisite for this section's durability claims to hold across a real crash, not just an in-process failure.
+
+### 8. Log Compaction & Snapshotting (InstallSnapshot RPC)  
+The Unbounded Log Problem
+An append-only log cannot grow indefinitely. If a key is updated 1,000,000 times:
+
+It consumes excessive disk/memory space.  
+
+Replaying 1,000,000 entries on startup takes minutes.    
+
+Log Compaction HorizonWhen the log reaches a threshold size, the node takes a point-in-time snapshot of the state machine up to index $K$, then discards all log entries $\le K$  
+```text
+Before Compaction:
+Log Index: [ 0 ]
+
+After Compacting up to Index 5 (lastIncludedIndex=5, lastIncludedTerm=2):
+Snapshot File: Contains state machine state as of Index 5.
+In-Memory Log: [ Index: 5 (Sentinel) ] [ Index: 6 ] [ Index: 7 ]
+                 ▲
+                 └─ Sentinel entry representing the snapshot boundary
+```
+The InstallSnapshot Protocol  
+When a follower is partitioned or lagging so far behind that the leader has already compacted the entries the follower needs (nextIndex[peer] <= firstIndex), the leader cannot use AppendEntries. It sends an InstallSnapshot RPC to fast-forward the follower directly to the snapshot horizon.
+```text
++--------------------------------------+
+                           |   Raft Consensus State Machine       |
+                           |   (Leader Election, Replication)     |
+                           +--------------------------------------+
+                                              │
+                         calls atomic Save()  │  queries Entries(), Term()
+                                              ▼
+                           +--------------------------------------+
+                           |       raft.Storage (Interface)       |
+                           +--------------------------------------+
+                                      ▲                ▲
+               ┌──────────────────────┴───────┐        └──────────────────────┐
+               │                              │                               │
++------------------------------+ +------------------------------+ +------------------------------+
+| Backend 1: MemStorage        | | Backend 2: KVStorage (Pebble)| | Backend 3: SegmentedFileWAL  |
+| - Fast unit tests            | | - CockroachDB pattern        | | - etcd/wal or tidwall/wal    |
+| - Microbenchmarking          | | - Atomic WriteBatch over L0  | | - Pre-allocated disk chunks  |
+| - In-memory SkipList         | | - Integrated with MVCC disk  | | - Raw disk platters          |
++------------------------------+ +------------------------------+ +------------------------------+
+```
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Layer 2: MVCC Engine                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+          │                                                  ▲
+          │ 1. Unapplied/Committed log > Threshold           │ 6. If follower lags,
+          │    (e.g., 5,000 entries or 32 MB)                │    delivers Snapshot
+          │                                                  │    via applyCh
+          ▼ 2. Calls ExportSnapshot(watermarkTS)             │
+┌────────────────────────────────────────────────────────────┴────────────────┐
+│                   Compactor / Snapshot Controller (Daemon)                  │
+│  - Dumps active MVCC dataset to bytes                                       │
+│  - Tracks lastAppliedIndex and lastAppliedTerm                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+          │
+          │ 3. Handshake: raftNode.Snapshot(appliedIndex, appliedTerm, data)
+          ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Milestone 2: Raft Consensus Engine                    │
+│  - 4. storage.CreateSnapshot(meta, data)                                    │
+│  - 5. raftLog.CompactLog(appliedIndex, appliedTerm)                         │
+│       (Entries <= appliedIndex are purged from RAM and disk)                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+## 9. The Pre-Vote Protocol (Raft §9.6)
+The Problem: How an Isolated Follower Destabilizes the Cluster
+Imagine a 3-node cluster:
+
+Node 1: Leader (Term 1)
+
+Node 2: Follower (Term 1)
+
+Node 3: Follower (Term 1)
+
+Now, network cables to Node 3 are severed (Node 3 is partitioned on an island).
+```text
+Healthy Quorum (Taking Writes):          Isolated Island:
++----------------+  +----------------+   +-------------------+
+| Node 1 (Leader)|  | Node 2 (Follow)|   | Node 3 (Follower) |
+| Term: 1        |  | Term: 1        |   | (Disconnected)    |
++----------------+  +----------------+   +-------------------+
+        ▲                   ▲                      │
+        └────── Quorum ─────┘                      │ 1. Election timer times out!
+                                                   │ 2. Bumps term: 1 -> 2 -> ... -> 50
+                                                   ▼ (Cannot get votes, keeps bumping)
+```
+- The Inflation Loop: While partitioned, Node 3 never receives heartbeats. Its election timer expires repeatedly. Every ~200 ms, Node 3 transitions to Candidate and increments its term:$$1 \rightarrow 2 \rightarrow 3 \rightarrow \dots \rightarrow \mathbf{50}$$
+- The Reconnection: The network heals, and Node 3 reconnects to the cluster.  
+- The Disruption: Node 3 broadcasts RequestVote with Term = 51.  
+- The Disaster:Node 1 (the legitimate Leader) and Node 2 receive Node 3’s message:
+
+```go
+if args.Term > rn.currentTerm { // 51 > 1
+    rn.currentTerm = args.Term
+    rn.role = RoleFollower // ❌ LEADER IS INSTANTLY DEPOSED!
+    rn.votedFor = 0
+}
+```
+
+The Service Outage:
+
+- Node 1 immediately abdicates leadership.
+- Can Node 3 become the new leader? NO, because its log is stale (it missed all writes while disconnected, so its up-to-date log check fails).
+- Result: Client writes freeze cluster-wide while the nodes waste time running unnecessary elections to re-elect Node 1 or Node 2 at Term 52.
+
+
+How Production Systems Solve This: The Pre-Vote Protocol (Raft §9.6)  
+- Tier-1 distributed systems (etcd, CockroachDB, TiKV, and Ongaro’s Raft dissertation §9.6) solve this by introducing an additional phase: **Pre-Vote**.  
+- A disconnected node is forbidden from incrementing its term or deposing a healthy leader unless it first proves it can win an election.
+```text
+Standard Raft (Vulnerable):
+Follower Times Out ────────► Increments Term ────────► Sends RequestVote (Deposes Leader)
+                                     ▲
+                             Term inflated here!
+
+
+                         Production Raft with Pre-Vote:
+Follower Times Out ────────► Sends PreVote (Trial Run) ───┬─► Majority Grants? ──► Increments Term
+                             (Does NOT bump term!)        │
+                                                          └─► Denied? ──────────► Back to Follower
+```
+How the Pre-Vote Protocol Works in 3 Rules
+Rule 1: A Trial Election (RolePreCandidate)
+When a follower's election timer expires, it does not become a RoleCandidate and does not increment currentTerm.
+Instead, it becomes a RolePreCandidate and asks peers:
+
+"If I were to start an election for currentTerm + 1, would you vote for me?"
+
+Rule 2: The Leader-Lease Protection on Followers
+When Node 1 or Node 2 receives a PreVote from Node 3:
+They will DENY the pre-vote if:
+
+They have received a heartbeat from a valid leader within their own ElectionTimeoutMin.
+
+OR the candidate's log is less up-to-date than their own.
+
+Because Node 1 and Node 2 are actively in contact with each other, they know the current leader is healthy. They reject Node 3's pre-vote:
+
+"No, we have an active leader and heard from it 20ms ago. We will not vote for you."
+
+Rule 3: The Result
+Node 3 receives 0 votes out of 2. It fails the pre-vote.
+
+Node 3’s term never increments.
+
+Node 1 remains the Leader, undisturbed.
+
+When the leader's next periodic heartbeat arrives at Node 3, Node 3 realizes Node 1 is alive and transitions back to RoleFollower.

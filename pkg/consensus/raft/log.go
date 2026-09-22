@@ -16,6 +16,24 @@ func NewRaftLog() *RaftLog {
 	}
 }
 
+func (l *RaftLog) FirstIndex() uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.entries[0].Index + 1
+}
+
+func (l *RaftLog) toSliceIndex(raftIndex uint64) (int, bool) {
+	firstIndex := l.entries[0].Index
+	if raftIndex < firstIndex {
+		return 0, false // Compacted entry
+	}
+	idx := int(raftIndex - firstIndex)
+	if idx >= len(l.entries) {
+		return 0, false // Out of bounds
+	}
+	return idx, true
+}
+
 // LastIndex returns the 1-based index of the most recent entry in the log.
 func (l *RaftLog) LastIndex() uint64 {
 	l.mu.RLock()
@@ -34,10 +52,12 @@ func (l *RaftLog) LastTerm() uint64 {
 func (l *RaftLog) TermAt(index uint64) (uint64, bool) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	if index >= uint64(len(l.entries)) {
+
+	idx, ok := l.toSliceIndex(index)
+	if !ok {
 		return 0, false
 	}
-	return l.entries[index].Term, true
+	return l.entries[idx].Term, true
 }
 
 // Append creates and stores a new log entry at index len(entries).
@@ -78,40 +98,33 @@ func (l *RaftLog) TruncateAndAppend(prevIndex uint64, newEntries []LogEntry) {
 func (l *RaftLog) Slice(fromIndex uint64) []LogEntry {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	if fromIndex >= uint64(len(l.entries)) {
+
+	sliceIdx, ok := l.toSliceIndex(fromIndex)
+	if !ok {
 		return nil
 	}
-	res := make([]LogEntry, len(l.entries)-int(fromIndex))
-	copy(res, l.entries[fromIndex:])
+	res := make([]LogEntry, len(l.entries)-sliceIdx)
+	copy(res, l.entries[sliceIdx:])
 	return res
 }
 
-// Propose submits a client mutation command to the leader's replicated log.
-// Returns (index, term, isLeader).
-func (rn *RaftNode) Propose(command []byte) (uint64, uint64, bool) {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
+func (l *RaftLog) CompactLog(lastIncludedIndex uint64, lastIncludedTerm uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-	if rn.role != RoleLeader {
-		return 0, 0, false
+	if lastIncludedIndex <= l.entries[0].Index {
+		return
 	}
 
-	entry := rn.log.Append(rn.currentTerm, command)
-	rn.matchIndex[rn.cfg.NodeID] = entry.Index
-	rn.nextIndex[rn.cfg.NodeID] = entry.Index + 1
+	offset := lastIncludedIndex - l.entries[0].Index
+	var remaining []LogEntry
 
-	rn.broadcastAppendEntriesLocked()
-	return entry.Index, entry.Term, true
-}
-
-// GetState returns current term and leadership boolean.
-func (rn *RaftNode) GetState() (uint64, bool) {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-	return rn.currentTerm, rn.role == RoleLeader
-}
-
-// Stop cleanly terminates timers and background routines.
-func (rn *RaftNode) Stop() {
-	close(rn.stopCh)
+	if offset < uint64(len(l.entries)) {
+		remaining = make([]LogEntry, len(l.entries)-int(offset))
+		copy(remaining, l.entries[offset:])
+		remaining[0] = LogEntry{Index: lastIncludedIndex, Term: lastIncludedTerm}
+	} else {
+		remaining = []LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+	}
+	l.entries = remaining
 }

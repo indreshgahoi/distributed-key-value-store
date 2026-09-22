@@ -38,14 +38,16 @@ Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
 - [x] **Leader election** (`pkg/consensus/raft`): randomized election timeouts, term-based voting, majority quorum
   - [x] `RequestVote` / `HandleRequestVote` — candidate solicitation with Election Safety (up-to-date-log check)
   - [x] Leader heartbeats via periodic empty `AppendEntries` to suppress follower elections
+  - [x] **Pre-Vote** (Raft §9.6): a two-phase election (trial round, then real) so an isolated node can't inflate its term or disrupt a healthy Leader on reconnect — see [docs/milestoneTwo.md §9](docs/milestoneTwo.md#9-the-pre-vote-protocol-raft-96)
 - [x] **Log replication** (`pkg/consensus/raft`): quorum-based commit, Log Matching Invariant
   - [x] `AppendEntries` / `HandleAppendEntries` — replication with conflict detection and truncation
   - [x] Commits only current-term entries by counting replicas (Raft Figure 8 safety)
   - [x] Async `applyCh` decouples consensus from MVCC state-machine application
 - [x] **Network transport** (`pkg/consensus/raft/transport.go`): TCP RPC via `net/rpc`, per-peer connection reuse
 - [x] **Node daemon** (`cmd/kv-server`): HTTP client API (`/put`, `/get`, `/status`) fronting a Raft-replicated MVCC store
-- [ ] Log persistence — currently in-memory only; a node restart loses its replicated log
-- [ ] Snapshotting / log compaction for Raft's own log (separate from Layer 2's MVCC GC)
+- [x] **Log persistence — interface & write path** (`pkg/consensus/raft/storage.go`): pluggable `Storage` interface; `KVStorage` calls `Save()` at every point Raft §5.2 requires (before granting a vote, before a real election, on every `AppendEntries`) — but see the caveat below
+  - [ ] **Actual crash durability**: `KVStorage` currently sits on Layer 0's `raw.SkipListEngine`, which is in-memory only (no on-disk backend — see the Layer 0 checklist above). So today, if a node's process dies, `Save()`'s writes die with it; a restart comes back with `Term=0, Vote=0`, a fresh empty log, and no memory of ever having voted. The interface is correctly shaped for real durability (matches etcd/raft's own storage abstraction), but needs a disk-backed `raw.ByteEngine` underneath before that's actually true. Details: [docs/milestoneTwo.md §7](docs/milestoneTwo.md#7-storage-durability--log-persistence)
+- [x] **Snapshotting & log compaction**: `RaftNode.Snapshot` compacts the in-memory and persisted log once Layer 2 checkpoints; `InstallSnapshot` RPC catches up a follower whose required entries were already compacted away
 
 Design notes and the full test-case catalog: [docs/milestoneTwo.md](docs/milestoneTwo.md).
 
@@ -63,9 +65,16 @@ distributed-key-value-store/
 │   │       ├── log.go             # ✅ RaftLog, Propose, GetState, Stop
 │   │       ├── config.go          # ✅ Config + timing-invariant validation
 │   │       ├── types.go           # ✅ NodeRole, LogEntry, RPC arg/reply types
-│   │       ├── transport.go       # ✅ TCPTransport over net/rpc
+│   │       ├── transport.go       # ✅ TCPTransport over net/rpc (incl. InstallSnapshot)
+│   │       ├── storage.go         # ✅ Storage interface + KVStorage (durable HardState/log over Layer 0)
+│   │       ├── snapshot.go        # ✅ InstallSnapshot RPC arg/reply types
 │   │       ├── raft_test.go       # ✅ Election, replication, partition, failover, race tests
-│   │       └── raft_bench_test.go # ✅ Log append & proposal throughput benchmarks
+│   │       ├── raft_bench_test.go # ✅ Log append & proposal throughput benchmarks
+│   │       ├── raft_snapshot_test.go       # ✅ Lagging-follower catch-up via InstallSnapshot
+│   │       ├── raft_snapshot_bench_test.go # ✅ MVCC snapshot export/restore benchmarks
+│   │       ├── storage_test.go             # ✅ KVStorage persistence & compaction test
+│   │       ├── raft_prevote_test.go        # ✅ Pre-Vote: no term inflation while isolated, stable leader survives reconnect
+│   │       └── raft_prevote_bench_test.go  # ✅ Leader-election latency benchmark
 │   │
 │   ├── storage/
 │   │   ├── raw/                   # ✅ Layer 0: raw ordered byte storage engine
@@ -83,7 +92,8 @@ distributed-key-value-store/
 │   │       ├── mvcc.go            # ✅ Put/Delete/Get/Scan over Layer 0 + Layer 1
 │   │       ├── mvcc_test.go       # ✅ Isolation, tombstone, and scan-dedup tests + benchmark
 │   │       ├── gc.go              # ✅ Watermark-based compaction (CompactBelowWatermark)
-│   │       └── gc_test.go         # ✅ Compaction correctness test
+│   │       ├── gc_test.go         # ✅ Compaction correctness test
+│   │       └── snapshot.go        # ✅ Export/import + atomic file save/load for Raft snapshots
 │   │
 │   └── common/                    # planned
 │       └── errors.go              # Domain-specific errors (KeyNotFound, StaleWrite)
@@ -187,7 +197,10 @@ go test -bench=BenchmarkRaft_LogAppend -benchmem -run='^$' -v ./pkg/consensus/ra
 go test -bench=BenchmarkRaft_SequentialProposals -benchmem -run='^$' -v ./pkg/consensus/raft/...
 # BenchmarkRaft_ConcurrentProposals needs a fixed -benchtime — default adaptive
 # scaling exhausts the test cluster's arena and panics the binary. See below.
-go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=2000x -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=600x -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkMVCC_SnapshotExport -benchmem -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkMVCC_SnapshotRestore -benchmem -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkRaft_LeaderElection -benchmem -run='^$' -v ./pkg/consensus/raft/...
 ```
 
 Raft-specific test-case catalog (what each test verifies) and a from-first-principles Raft primer: [docs/milestoneTwo.md](docs/milestoneTwo.md#6-testing--verification).
@@ -202,9 +215,16 @@ Benchmark baselines are committed under [bench/](bench/) so throughput and alloc
 | 1 — `codec` | 0 B/op, 0 allocs/op (`EncodeKeyAppend` with reused buffer) | [bench/BenchmarkCodec_ZeroAllocEncode.txt](bench/BenchmarkCodec_ZeroAllocEncode.txt) |
 | 2 — `mvcc` | ~200 ns/op, 96 B/op, 4 allocs/op (snapshot `Get` resolving the newest of 10 versions) | [bench/BenchmarkMVCC_SnapshotPointGet.txt](bench/BenchmarkMVCC_SnapshotPointGet.txt) |
 | raft — log append | ~110 ns/op, 0 allocs/op (in-memory, no network) | [bench/BenchmarkRaft_LogAppend.txt](bench/BenchmarkRaft_LogAppend.txt) |
-| raft — sequential propose | ~1.2 ms/op, 37 allocs/op (full propose → quorum → commit → apply) | [bench/BenchmarkRaft_SequentialProposals.txt](bench/BenchmarkRaft_SequentialProposals.txt) |
-| raft — concurrent propose | ~14 µs/op under contention (capped at 2000 iterations, see note) | [bench/BenchmarkRaft_ConcurrentProposals.txt](bench/BenchmarkRaft_ConcurrentProposals.txt) |
+| raft — sequential propose | ~1.25 ms/op, 68 allocs/op (full propose → quorum → commit → apply, now incl. `KVStorage` persistence) | [bench/BenchmarkRaft_SequentialProposals.txt](bench/BenchmarkRaft_SequentialProposals.txt) |
+| raft — concurrent propose | ~10-80 µs/op under contention (capped at 600 iterations, see note) | [bench/BenchmarkRaft_ConcurrentProposals.txt](bench/BenchmarkRaft_ConcurrentProposals.txt) |
+| mvcc — snapshot export | ~1.3 ms/op, ~1.37 MB/op (streaming 10,000 live keys) | [bench/BenchmarkMVCC_SnapshotExport.txt](bench/BenchmarkMVCC_SnapshotExport.txt) |
+| mvcc — snapshot restore | ~11 ms/op, ~68 MB/op (replaying 10,000 keys into a fresh store) | [bench/BenchmarkMVCC_SnapshotRestore.txt](bench/BenchmarkMVCC_SnapshotRestore.txt) |
+| raft — leader election | ~95 ms/op (time-to-first-leader on a fresh cluster, incl. the Pre-Vote round-trip) | [bench/BenchmarkRaft_LeaderElection.txt](bench/BenchmarkRaft_LeaderElection.txt) |
 
 Layer 2's `Get` isn't zero-allocation like the layers below it — it allocates a seek-key buffer, a key-decode scratch buffer, and clones the returned payload to protect the caller from the storage engine's internal memory. That's expected at this layer, not a regression.
 
-`BenchmarkRaft_ConcurrentProposals` must be run with a fixed `-benchtime` (e.g. `-benchtime=2000x`) — see [bench/README.md](bench/README.md) for why.
+`BenchmarkRaft_ConcurrentProposals` must be run with a fixed `-benchtime` (e.g. `-benchtime=600x`) — see [bench/README.md](bench/README.md) for why.
+
+## License
+
+[MIT](LICENSE)

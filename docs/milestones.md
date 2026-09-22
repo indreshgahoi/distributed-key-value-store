@@ -5,12 +5,12 @@ Building a distributed transactional key-value database from scratch can feel da
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Local MVCC Storage Engine (Single Node) | ✅ Done |
-| 2 | Single Group Raft Consensus | ⬜ Not started |
+| 2 | Single Group Raft Consensus | 🚧 In progress |
 | 3 | Multi-Raft and Range Sharding | ⬜ Not started |
 | 4 | Hybrid Logical Clock (HLC) | ⬜ Not started |
 | 5 | Multi-Range 2PC (Percolator Model) | ⬜ Not started |
 
-See [milestoneOne.md](milestoneOne.md) for the Milestone 1 layer breakdown, and the top-level [README](../README.md) for current build status within that milestone.
+See [milestoneOne.md](milestoneOne.md) for the Milestone 1 layer breakdown and [milestoneTwo.md](milestoneTwo.md) for the Milestone 2 Raft design and test-case catalog. The top-level [README](../README.md) has current build status within each milestone.
 
 ### Technology
 

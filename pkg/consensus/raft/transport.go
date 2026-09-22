@@ -13,6 +13,7 @@ import (
 type NetworkTransport interface {
 	SendRequestVote(ctx context.Context, to uint64, args *RequestVoteArgs) (*RequestVoteReply, error)
 	SendAppendEntries(ctx context.Context, to uint64, args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	SendInstallSnapshot(ctx context.Context, to uint64, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }
 
 // RPCHandler bridges inbound network RPCs to the local RaftNode instance.
@@ -23,6 +24,12 @@ type RPCHandler struct {
 // RequestVote dispatches an incoming election vote request.
 func (h *RPCHandler) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	h.node.HandleRequestVote(args, reply)
+	return nil
+}
+
+// InstallSnapshot dispatches an incoming snapshot installation from the Leader.
+func (h *RPCHandler) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	h.node.HandleInstallSnapshot(args, reply)
 	return nil
 }
 
@@ -135,6 +142,29 @@ func (t *TCPTransport) SendAppendEntries(ctx context.Context, to uint64, args *A
 
 	reply := &AppendEntriesReply{}
 	call := client.Go("Raft.AppendEntries", args, reply, nil)
+
+	select {
+	case <-ctx.Done():
+		t.closeClient(to)
+		return nil, ctx.Err()
+	case res := <-call.Done:
+		if res.Error != nil {
+			t.closeClient(to)
+			return nil, res.Error
+		}
+		return reply, nil
+	}
+}
+
+// SendInstallSnapshot streams a snapshot to a lagging follower.
+func (t *TCPTransport) SendInstallSnapshot(ctx context.Context, to uint64, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	client, err := t.getClient(to)
+	if err != nil {
+		return nil, err
+	}
+
+	reply := &InstallSnapshotReply{}
+	call := client.Go("Raft.InstallSnapshot", args, reply, nil)
 
 	select {
 	case <-ctx.Done():

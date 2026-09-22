@@ -12,6 +12,10 @@
 *.out
 coverage.html
 
+# Runtime data: MVCC snapshot files written by cmd/kv-server on boot/ticker
+data_node*.snap
+*.snap.tmp
+
 # Go build cache artifacts if ever vendored locally
 /vendor/
 

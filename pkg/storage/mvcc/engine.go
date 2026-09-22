@@ -2,6 +2,7 @@ package mvcc
 
 import (
 	"errors"
+	"io"
 )
 
 var (
@@ -35,4 +36,10 @@ type MVCCStore interface {
 
 	// Close shuts down the underlying engine.
 	Close() error
+
+	// ExportSnapshot streams all active versions <= safeWatermarkTS to an io.Writer.
+	ExportSnapshot(w io.Writer, safeWatermarkTS uint64) error
+
+	// RestoreSnapshot reads a binary snapshot stream and loads it into the storage engine.
+	RestoreSnapshot(r io.Reader) error
 }

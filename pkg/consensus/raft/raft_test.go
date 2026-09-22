@@ -122,6 +122,24 @@ func (n *SimulatedNetwork) SendAppendEntries(ctx context.Context, to uint64, arg
 	return reply, nil
 }
 
+func (n *SimulatedNetwork) SendInstallSnapshot(ctx context.Context, to uint64, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	if n.isBlocked(args.LeaderID, to) {
+		return nil, context.DeadlineExceeded
+	}
+
+	n.mu.RLock()
+	targetNode := n.nodes[to]
+	n.mu.RUnlock()
+
+	if targetNode == nil {
+		return nil, fmt.Errorf("node %d not found", to)
+	}
+
+	reply := &InstallSnapshotReply{}
+	targetNode.HandleInstallSnapshot(args, reply)
+	return reply, nil
+}
+
 type TestCluster struct {
 	peers  []uint64
 	net    *SimulatedNetwork
@@ -158,7 +176,12 @@ func NewTestCluster(t *testing.T, nodeCount int) *TestCluster {
 		store := mvcc.NewStore(rawEngine)
 		tc.stores[id] = store
 
-		node, err := NewRaftNode(cfg, net, applyCh)
+		storage, err := NewKVStorage(raw.NewSkipListEngine(16 * 1024 * 1024))
+		if err != nil && t != nil {
+			t.Fatalf("failed to create storage for node %d: %v", id, err)
+		}
+
+		node, err := NewRaftNode(cfg, net, storage, applyCh)
 		if err != nil && t != nil {
 			t.Fatalf("failed to create node %d: %v", id, err)
 		}

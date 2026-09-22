@@ -11,8 +11,10 @@ const (
 	// election timeout elapses, the follower transitions to RoleCandidate.
 	RoleFollower NodeRole = iota
 
+	RolePreCandidate // Trial election: does not increment currentTerm
+
 	// RoleCandidate is the election state. The node increments its term, votes for
-	// itself, and broadcasts RequestVote RPCs to gather a majority quorum.
+	// itself, and broadcasts RequestVote RPCs to gather a majority quorum. Real election: increments currentTerm
 	RoleCandidate
 
 	// RoleLeader manages all client writes, appends entries to its local log,
@@ -25,6 +27,8 @@ func (r NodeRole) String() string {
 	switch r {
 	case RoleFollower:
 		return "Follower"
+	case RolePreCandidate:
+		return "PreCandidate"
 	case RoleCandidate:
 		return "Candidate"
 	case RoleLeader:
@@ -59,6 +63,8 @@ type RequestVoteArgs struct {
 
 	// LastLogTerm is the term of the candidate's last log entry.
 	LastLogTerm uint64
+	// true for Pre-Vote trial run
+	IsPreVote bool
 }
 
 // RequestVoteReply contains the voter's decision.
