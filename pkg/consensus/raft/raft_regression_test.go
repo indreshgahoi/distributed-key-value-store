@@ -74,7 +74,7 @@ func TestRaft_StaleAppendEntriesDoesNotTruncateDurableLog(t *testing.T) {
 		t.Fatalf("expected stale-but-consistent AppendEntries to succeed")
 	}
 
-	if got := node.log.LastIndex(); got != 5 {
+	if got := node.Status().LastIndex; got != 5 {
 		t.Fatalf("in-memory log: expected LastIndex 5, got %d", got)
 	}
 	if got, _ := storage.LastIndex(); got != 5 {

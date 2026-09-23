@@ -29,24 +29,26 @@ func TestRaft_ProposeAfterSnapshotCompactionUsesCorrectIndex(t *testing.T) {
 		t.Fatalf("election failed: %v", err)
 	}
 
+	// Index 1 holds the leader's election no-op, so the first client
+	// command lands at 2; what matters is the index right after compaction.
 	idx1, _, isLeader := tc.nodes[leaderID].Propose([]byte("account:carol:verified"))
-	if !isLeader || idx1 != 1 {
-		t.Fatalf("expected first Propose to return index 1, got idx=%d isLeader=%v", idx1, isLeader)
+	if !isLeader || idx1 != 2 {
+		t.Fatalf("expected first Propose to return index 2 (after the no-op), got idx=%d isLeader=%v", idx1, isLeader)
 	}
 	time.Sleep(150 * time.Millisecond) // let it commit, apply, and replicate
 
-	// Compact the log through index 1 - the exact trigger for this bug.
-	if err := tc.nodes[leaderID].Snapshot(1, []byte("snapshot-at-1")); err != nil {
+	// Compact the log through idx1 - the exact trigger for this bug.
+	if err := tc.nodes[leaderID].Snapshot(idx1, []byte("snapshot-at-idx1")); err != nil {
 		t.Fatalf("snapshot failed: %v", err)
 	}
 
-	// This is exactly what returned index 1 again (instead of 2) before the fix.
+	// This is exactly what returned idx1 again (instead of idx1+1) before the fix.
 	idx2, _, isLeader2 := tc.nodes[leaderID].Propose([]byte("account:carol1:verified1"))
 	if !isLeader2 {
 		t.Fatalf("leader lost leadership unexpectedly")
 	}
-	if idx2 != 2 {
-		t.Fatalf("expected second Propose (after compaction) to return index 2, got %d", idx2)
+	if idx2 != idx1+1 {
+		t.Fatalf("expected second Propose (after compaction) to return index %d, got %d", idx1+1, idx2)
 	}
 	if idx2 == idx1 {
 		t.Fatalf("second Propose returned the same index as the first (%d) - this is the exact bug reported from live testing", idx2)
@@ -60,10 +62,10 @@ func TestRaft_ProposeAfterSnapshotCompactionUsesCorrectIndex(t *testing.T) {
 		tc.nodes[id].mu.Lock()
 		lastIdx := tc.nodes[id].log.LastIndex()
 		tc.nodes[id].mu.Unlock()
-		if lastIdx != 2 {
-			t.Fatalf("node %d: expected log to reach index 2 after post-compaction replication, got %d", id, lastIdx)
+		if lastIdx != idx2 {
+			t.Fatalf("node %d: expected log to reach index %d after post-compaction replication, got %d", id, idx2, lastIdx)
 		}
 	}
 
-	t.Logf("PASS: Propose after compaction correctly returned index 2, and replicated to all followers")
+	t.Logf("PASS: Propose after compaction correctly returned the next index, and replicated to all followers")
 }

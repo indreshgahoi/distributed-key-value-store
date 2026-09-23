@@ -1,9 +1,12 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStorage_TidwallStorage_CrashReplayAndCompaction(t *testing.T) {
@@ -125,4 +128,124 @@ func TestStorage_TidwallStorage_CrashReplayAndCompaction(t *testing.T) {
 	}
 
 	t.Logf("PASS: TidwallStorage passed all persistence, conflict truncation, and O(1) compaction checks!")
+}
+
+// TestStorage_TidwallStorage_InstallSnapshotBeyondLog covers a follower
+// installing a leader's snapshot past the end of its own log: the WAL is
+// replaced by a fresh one based at the snapshot index, new entries continue
+// from there, and all of it survives a reopen.
+func TestStorage_TidwallStorage_InstallSnapshotBeyondLog(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewTidwallStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(HardState{Term: 1}, makeEntries(1, 3, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplySnapshot(SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 2}, []byte("leader-state")); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+	if first, _ := s.FirstIndex(); first != 11 {
+		t.Fatalf("expected FirstIndex 11, got %d", first)
+	}
+	if last, _ := s.LastIndex(); last != 10 {
+		t.Fatalf("expected LastIndex 10 (the snapshot), got %d", last)
+	}
+	if _, err := s.Entries(2, 3, ^uint64(0)); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("pre-snapshot entries must be gone, got %v", err)
+	}
+	// This write used to be impossible: tidwall/wal requires an empty log to
+	// start at index 1.
+	if err := s.Save(HardState{Term: 2}, makeEntries(11, 12, 2)); err != nil {
+		t.Fatalf("appending after the snapshot: %v", err)
+	}
+	s.Close()
+
+	s, err = NewTidwallStorage(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+	if last, _ := s.LastIndex(); last != 12 {
+		t.Fatalf("after reopen: expected LastIndex 12, got %d", last)
+	}
+	if term, err := s.Term(10); err != nil || term != 2 {
+		t.Fatalf("after reopen: snapshot boundary term expected 2, got %d (%v)", term, err)
+	}
+	if data, err := s.SnapshotData(); err != nil || string(data) != "leader-state" {
+		t.Fatalf("after reopen: snapshot data %q (%v)", data, err)
+	}
+	entries, err := s.Entries(11, 13, ^uint64(0))
+	if err != nil || len(entries) != 2 || entries[1].Index != 12 {
+		t.Fatalf("after reopen: entries 11-12 unreadable: %v %+v", err, entries)
+	}
+	names, _ := os.ReadDir(dir)
+	if len(names) != 3 {
+		var got []string
+		for _, n := range names {
+			got = append(got, n.Name())
+		}
+		t.Fatalf("expected only metadata, one snapshot, one WAL dir; found %v", got)
+	}
+}
+
+// TestStorage_TidwallStorage_InstallSnapshotKeepsMatchingSuffix: when the log
+// agrees with the snapshot at its boundary, the entries after it are kept.
+func TestStorage_TidwallStorage_InstallSnapshotKeepsMatchingSuffix(t *testing.T) {
+	s, err := NewTidwallStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Save(HardState{Term: 1}, makeEntries(1, 5, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplySnapshot(SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 1}, []byte("s")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.Entries(4, 6, ^uint64(0))
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("suffix after a matching snapshot must be kept: %v %+v", err, entries)
+	}
+}
+
+// TestStorage_TidwallStorage_RejectsIncompatibleFormat: a directory written
+// by an older layout fails fast instead of being misread.
+func TestStorage_TidwallStorage_RejectsIncompatibleFormat(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"HS":{"term":3,"vote":1,"commit":2},"SnapMeta":{"last_included_index":0,"last_included_term":0}}`
+	if err := os.WriteFile(filepath.Join(dir, "metadata.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewTidwallStorage(dir); !errors.Is(err, ErrIncompatibleFormat) {
+		t.Fatalf("expected ErrIncompatibleFormat, got %v", err)
+	}
+}
+
+// TestStorage_TidwallStorage_UnchangedHardStateIsNotRewritten: heartbeats
+// re-save the same HardState constantly; that must not cost an fsync.
+func TestStorage_TidwallStorage_UnchangedHardStateIsNotRewritten(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewTidwallStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	hs := HardState{Term: 4, Vote: 2, Commit: 1}
+	if err := s.Save(hs, nil); err != nil {
+		t.Fatal(err)
+	}
+	meta := filepath.Join(dir, "metadata.json")
+	before, _ := os.Stat(meta)
+	time.Sleep(10 * time.Millisecond)
+	for i := 0; i < 5; i++ {
+		if err := s.Save(hs, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, _ := os.Stat(meta)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("metadata.json rewritten for an unchanged HardState")
+	}
 }

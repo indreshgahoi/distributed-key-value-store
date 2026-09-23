@@ -458,9 +458,9 @@ func TestRaft_ConcurrentProposalsAndRace(t *testing.T) {
 	wg.Wait()
 	time.Sleep(500 * time.Millisecond)
 
-	expectedLen := tc.nodes[leaderID].log.LastIndex()
+	expectedLen := tc.nodes[leaderID].Status().LastIndex
 	for _, id := range tc.peers {
-		lastIdx := tc.nodes[id].log.LastIndex()
+		lastIdx := tc.nodes[id].Status().LastIndex
 		if lastIdx != expectedLen {
 			t.Fatalf("Node %d log index %d diverged from leader index %d", id, lastIdx, expectedLen)
 		}
