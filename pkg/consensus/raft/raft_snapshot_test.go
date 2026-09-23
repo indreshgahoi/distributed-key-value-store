@@ -40,7 +40,7 @@ func TestRaft_InstallSnapshotToLaggingFollower(t *testing.T) {
 		rafts[id] = node
 		net.Register(id, node)
 
-		go func(nid uint64, ch chan ApplyMsg, s *mvcc.Store) {
+		go func(node *RaftNode, ch chan ApplyMsg, s *mvcc.Store) {
 			for msg := range ch {
 				if msg.CommandValid {
 					sep := bytes.LastIndexByte(msg.Command, ':')
@@ -51,8 +51,9 @@ func TestRaft_InstallSnapshotToLaggingFollower(t *testing.T) {
 					// Snapshot restoration
 					_ = s.RestoreSnapshot(bytes.NewReader(msg.Command))
 				}
+				node.ReportApplied(msg.CommandIndex)
 			}
-		}(id, applyCh, store)
+		}(node, applyCh, store)
 	}
 
 	defer func() {

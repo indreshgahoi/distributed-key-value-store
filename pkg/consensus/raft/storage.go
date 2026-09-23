@@ -29,6 +29,10 @@ var (
 	// the caller's context expired - e.g. this node is the Leader of a
 	// minority partition and doesn't know it yet.
 	ErrQuorumUnreachable = errors.New("raft: could not confirm leadership with a quorum before deadline")
+
+	// ErrSnapshotAheadOfApplied is returned by Snapshot when asked to compact
+	// past the index the state machine has confirmed via ReportApplied.
+	ErrSnapshotAheadOfApplied = errors.New("raft: snapshot index is beyond the state machine's reported applied index")
 )
 
 // HardState represents the non-volatile consensus variables that MUST be persisted

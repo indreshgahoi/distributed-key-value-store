@@ -221,67 +221,94 @@ func main() {
 	}
 	log.Printf("[Node %d] Consensus engine running on %s", *nodeID, *raftAddr)
 
-	// 10. Background state-machine applier.
+	// 10. State-machine applier, which also owns snapshotting.
+	//
+	// This goroutine is the only writer to the store, so running the snapshot
+	// here - rather than on an independent ticker goroutine - guarantees the
+	// index handed to node.Snapshot matches the exported data exactly: no
+	// apply can land between reading the index and exporting the state.
 	proposalTracker := NewProposalTracker()
+	applyMsg := func(msg raft.ApplyMsg) {
+		// Snapshot installations from the Leader (InstallSnapshot RPC).
+		if !msg.CommandValid {
+			if err := store.RestoreSnapshot(bytes.NewReader(msg.Command)); err != nil {
+				log.Printf("[State Machine] Failed to restore snapshot at index %d: %v", msg.CommandIndex, err)
+			} else {
+				log.Printf("[State Machine] Restored snapshot at Index %d (Term %d)", msg.CommandIndex, msg.CommandTerm)
+			}
+			return
+		}
+
+		// Regular committed client commands.
+		var cmd CommandPayload
+		if err := json.Unmarshal(msg.Command, &cmd); err != nil {
+			log.Printf("Failed to unmarshal command at index %d: %v", msg.CommandIndex, err)
+			proposalTracker.Notify(msg.CommandIndex, msg.CommandTerm, err)
+			return
+		}
+
+		commitTS := msg.CommandIndex * 10
+		var applyErr error
+		switch cmd.Op {
+		case "PUT":
+			applyErr = store.Put([]byte(cmd.Key), []byte(cmd.Value), commitTS)
+			log.Printf("[State Machine] Applied Index %d: PUT %s = %s (TS: %d)", msg.CommandIndex, cmd.Key, cmd.Value, commitTS)
+		case "DELETE":
+			applyErr = store.Delete([]byte(cmd.Key), commitTS)
+			log.Printf("[State Machine] Applied Index %d: DELETE %s (TS: %d)", msg.CommandIndex, cmd.Key, commitTS)
+		}
+		// Wake up any /put handler blocked on this index - a no-op if
+		// nobody's waiting (e.g. this entry arrived via normal
+		// replication on a follower, or the HTTP request already timed
+		// out and canceled its wait).
+		proposalTracker.Notify(msg.CommandIndex, msg.CommandTerm, applyErr)
+	}
+
+	takeSnapshot := func() {
+		appliedIndex := node.LastApplied()
+		if appliedIndex == 0 {
+			return
+		}
+		watermark := uint64(time.Now().UnixNano())
+
+		// A. Persist Layer 2's snapshot file first. If this fails, Raft must
+		// NOT compact: the log would then be the only copy of those entries.
+		if err := store.SaveSnapshotToFile(snapPath, watermark); err != nil {
+			log.Printf("[Snapshot] Failed to save %s, skipping log compaction: %v", snapPath, err)
+			return
+		}
+
+		// B. Hand the same state to Raft so it can compact its own log.
+		var snapBuf bytes.Buffer
+		if err := store.ExportSnapshot(&snapBuf, watermark); err != nil {
+			log.Printf("[Snapshot] Failed to export state at index %d: %v", appliedIndex, err)
+			return
+		}
+		if err := node.Snapshot(appliedIndex, snapBuf.Bytes()); err != nil && !errors.Is(err, raft.ErrSnapshotOutOfDate) {
+			log.Printf("[Snapshot] Raft log compaction at index %d failed: %v", appliedIndex, err)
+		}
+	}
+
 	go func() {
-		for msg := range applyCh {
-			// Snapshot installations from the Leader (InstallSnapshot RPC).
-			if !msg.CommandValid {
-				if err := store.RestoreSnapshot(bytes.NewReader(msg.Command)); err != nil {
-					log.Printf("[State Machine] Failed to restore snapshot at index %d: %v", msg.CommandIndex, err)
-				} else {
-					log.Printf("[State Machine] Restored snapshot at Index %d (Term %d)", msg.CommandIndex, msg.CommandTerm)
+		snapshotTicker := time.NewTicker(30 * time.Second)
+		defer snapshotTicker.Stop()
+		for {
+			select {
+			case msg, ok := <-applyCh:
+				if !ok {
+					return
 				}
-				continue
+				applyMsg(msg)
+				// Only now is the entry reflected in the store; this is what
+				// gates linearizable reads (WaitApplied) and compaction.
+				node.ReportApplied(msg.CommandIndex)
+			case <-snapshotTicker.C:
+				takeSnapshot()
 			}
-
-			// Regular committed client commands.
-			var cmd CommandPayload
-			if err := json.Unmarshal(msg.Command, &cmd); err != nil {
-				log.Printf("Failed to unmarshal command at index %d: %v", msg.CommandIndex, err)
-				continue
-			}
-
-			commitTS := msg.CommandIndex * 10
-			var applyErr error
-			switch cmd.Op {
-			case "PUT":
-				applyErr = store.Put([]byte(cmd.Key), []byte(cmd.Value), commitTS)
-				log.Printf("[State Machine] Applied Index %d: PUT %s = %s (TS: %d)", msg.CommandIndex, cmd.Key, cmd.Value, commitTS)
-			case "DELETE":
-				applyErr = store.Delete([]byte(cmd.Key), commitTS)
-				log.Printf("[State Machine] Applied Index %d: DELETE %s (TS: %d)", msg.CommandIndex, cmd.Key, commitTS)
-			}
-			// Wake up any /put handler blocked on this index - a no-op if
-			// nobody's waiting (e.g. this entry arrived via normal
-			// replication on a follower, or the HTTP request already timed
-			// out and canceled its wait).
-			proposalTracker.Notify(msg.CommandIndex, msg.CommandTerm, applyErr)
 		}
 	}()
 
-	// 11. Periodic state-machine snapshot & Raft log compaction loop.
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			watermark := uint64(time.Now().UnixNano())
-
-			// A. Persist Layer 2's snapshot file to disk.
-			_ = store.SaveSnapshotToFile(snapPath, watermark)
-
-			// B. Hand the snapshot to Raft so it can compact its own log.
-			lastApplied := node.LastApplied()
-			if lastApplied > 0 {
-				var snapBuf bytes.Buffer
-				if err := store.ExportSnapshot(&snapBuf, watermark); err == nil {
-					_ = node.Snapshot(lastApplied, snapBuf.Bytes())
-				}
-			}
-		}
-	}()
-
-	// 12. Public HTTP client API.
+	// 11. Public HTTP client API.
 	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

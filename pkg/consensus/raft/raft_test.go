@@ -188,7 +188,7 @@ func NewTestCluster(t *testing.T, nodeCount int) *TestCluster {
 		tc.nodes[id] = node
 		net.Register(id, node)
 
-		go func(nid uint64, ch chan ApplyMsg, s *mvcc.Store) {
+		go func(node *RaftNode, ch chan ApplyMsg, s *mvcc.Store) {
 			for msg := range ch {
 				if msg.CommandValid {
 					// Commands are "key:value", but the key itself may contain
@@ -200,8 +200,9 @@ func NewTestCluster(t *testing.T, nodeCount int) *TestCluster {
 						_ = s.Put(key, value, msg.CommandIndex*10)
 					}
 				}
+				node.ReportApplied(msg.CommandIndex)
 			}
-		}(id, applyCh, store)
+		}(node, applyCh, store)
 	}
 
 	return tc

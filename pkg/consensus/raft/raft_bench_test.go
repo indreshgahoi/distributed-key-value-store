@@ -44,11 +44,9 @@ func BenchmarkRaft_SequentialProposals(b *testing.B) {
 		// Wait until entry applied to state machine
 		applied := false
 		for attempt := 0; attempt < 50; attempt++ {
-			tc.nodes[leaderID].mu.Lock()
-			if tc.nodes[leaderID].lastApplied >= idx {
+			if tc.nodes[leaderID].LastApplied() >= idx {
 				applied = true
 			}
-			tc.nodes[leaderID].mu.Unlock()
 			if applied {
 				break
 			}

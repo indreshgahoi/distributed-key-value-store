@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -176,5 +178,70 @@ func recvApply(t *testing.T, ch <-chan ApplyMsg) ApplyMsg {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for ApplyMsg")
 		return ApplyMsg{}
+	}
+}
+
+// TestRaft_LastAppliedTracksStateMachineNotDispatch is a regression test for
+// lastApplied advancing the moment committed entries were *queued* for
+// applyCh, before the state machine had received - let alone applied - them.
+// Both consumers of that value were then wrong: WaitApplied let ReadIndex
+// reads run against a store that hadn't caught up (breaking
+// linearizability), and Snapshot let the log be compacted past entries the
+// snapshot data didn't contain (losing them).
+func TestRaft_LastAppliedTracksStateMachineNotDispatch(t *testing.T) {
+	storage, err := NewTidwallStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to open storage: %v", err)
+	}
+	defer storage.Close()
+
+	applyCh := make(chan ApplyMsg, 10)
+	node, err := NewRaftNode(quietFollowerConfig(), NewSimulatedNetwork(), storage, applyCh)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
+
+	reply := &AppendEntriesReply{}
+	node.HandleAppendEntries(&AppendEntriesArgs{
+		Term: 1, LeaderID: 1, Entries: makeEntries(1, 3, 1), LeaderCommit: 3,
+	}, reply)
+	if !reply.Success {
+		t.Fatalf("AppendEntries failed")
+	}
+
+	// Committed and queued, but the state machine hasn't reported anything.
+	if got := node.LastApplied(); got != 0 {
+		t.Fatalf("expected LastApplied 0 before any ReportApplied, got %d", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := node.WaitApplied(ctx, 3); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected WaitApplied to block until reported, got err=%v", err)
+	}
+	if err := node.Snapshot(3, []byte("state")); !errors.Is(err, ErrSnapshotAheadOfApplied) {
+		t.Fatalf("expected Snapshot past the applied index to be refused, got err=%v", err)
+	}
+
+	// A waiter blocked before the report must be woken by it.
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- node.WaitApplied(context.Background(), 3) }()
+
+	for i := 0; i < 3; i++ {
+		node.ReportApplied(recvApply(t, applyCh).CommandIndex)
+	}
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("WaitApplied returned error after report: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("WaitApplied was not woken by ReportApplied")
+	}
+	if got := node.LastApplied(); got != 3 {
+		t.Fatalf("expected LastApplied 3 after reports, got %d", got)
+	}
+	if err := node.Snapshot(3, []byte("state")); err != nil {
+		t.Fatalf("Snapshot at the applied index should succeed, got %v", err)
 	}
 }

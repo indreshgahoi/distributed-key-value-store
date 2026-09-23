@@ -22,8 +22,14 @@ type RaftNode struct {
 	log         *RaftLog
 	// Volatile State on all node
 	commitIndex uint64
-	lastApplied uint64
-	role        NodeRole
+	// lastDispatched is the highest index queued for the state machine;
+	// lastApplied is the highest index the state machine has confirmed via
+	// ReportApplied. Only lastApplied may gate reads (WaitApplied) or log
+	// compaction (Snapshot): a queued entry may not have been applied yet.
+	lastDispatched uint64
+	lastApplied    uint64
+	appliedSignal  chan struct{} // closed and replaced whenever lastApplied advances
+	role           NodeRole
 	// Volatile State leader Only
 	nextIndex  map[uint64]uint64
 	matchIndex map[uint64]uint64
@@ -62,14 +68,18 @@ func NewRaftNode(
 		return nil, err
 	}
 	rn := &RaftNode{
-		cfg:               cfg,
-		transport:         transport,
-		storage:           storage,
-		currentTerm:       hs.Term,
-		votedFor:          hs.Vote,
-		log:               NewRaftLog(),
-		commitIndex:       hs.Commit,
+		cfg:            cfg,
+		transport:      transport,
+		storage:        storage,
+		currentTerm:    hs.Term,
+		votedFor:       hs.Vote,
+		log:            NewRaftLog(),
+		commitIndex:    hs.Commit,
+		lastDispatched: snapMeta.LastIncludedIndex,
+		// The snapshot boundary is a safe floor: the state machine must
+		// already hold at least the snapshot's state before booting Raft.
 		lastApplied:       snapMeta.LastIncludedIndex,
+		appliedSignal:     make(chan struct{}),
 		lastSnapshotIndex: snapMeta.LastIncludedIndex,
 		lastSnapshotTerm:  snapMeta.LastIncludedTerm,
 		nextIndex:         make(map[uint64]uint64),
@@ -113,7 +123,7 @@ func NewRaftNode(
 	// snapshot ticker in cmd/kv-server/main.go - replaying into rn.log alone
 	// fixes Raft's own bookkeeping but silently leaves the actual data
 	// missing after a restart unless this also re-drives applyCh.
-	if rn.commitIndex > rn.lastApplied {
+	if rn.commitIndex > rn.lastDispatched {
 		rn.scheduleApplyLocked()
 	}
 
@@ -590,8 +600,8 @@ func (rn *RaftNode) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *Inst
 	if args.LastIncludedIndex > rn.commitIndex {
 		rn.commitIndex = args.LastIncludedIndex
 	}
-	if args.LastIncludedIndex > rn.lastApplied {
-		rn.lastApplied = args.LastIncludedIndex
+	if args.LastIncludedIndex > rn.lastDispatched {
+		rn.lastDispatched = args.LastIncludedIndex
 	}
 
 	// Deliver snapshot to the state machine through the same ordered queue as
@@ -635,14 +645,14 @@ func (rn *RaftNode) checkAdvanceCommitIndexLocked() {
 // for applyLoop, so the consensus engine never blocks on a slow state machine.
 func (rn *RaftNode) scheduleApplyLocked() {
 	var toApply []ApplyMsg
-	for rn.commitIndex > rn.lastApplied {
-		rn.lastApplied++
-		term, _ := rn.log.TermAt(rn.lastApplied)
-		slice := rn.log.Slice(rn.lastApplied)
+	for rn.commitIndex > rn.lastDispatched {
+		rn.lastDispatched++
+		term, _ := rn.log.TermAt(rn.lastDispatched)
+		slice := rn.log.Slice(rn.lastDispatched)
 		if len(slice) > 0 {
 			toApply = append(toApply, ApplyMsg{
 				CommandValid: true,
-				CommandIndex: rn.lastApplied,
+				CommandIndex: rn.lastDispatched,
 				CommandTerm:  term,
 				Command:      slice[0].Data,
 			})
@@ -700,6 +710,11 @@ func (rn *RaftNode) Snapshot(appliedIndex uint64, stateMachineData []byte) error
 
 	if appliedIndex <= rn.lastSnapshotIndex {
 		return ErrSnapshotOutOfDate
+	}
+	// Compacting past what the state machine has confirmed would discard
+	// log entries whose effects the snapshot data doesn't contain.
+	if appliedIndex > rn.lastApplied {
+		return ErrSnapshotAheadOfApplied
 	}
 
 	term, _ := rn.log.TermAt(appliedIndex)
@@ -844,30 +859,45 @@ func (rn *RaftNode) ReadIndex(ctx context.Context) (uint64, error) {
 	return 0, ErrQuorumUnreachable
 }
 
-// WaitApplied blocks until LastApplied() reaches at least index, or ctx is
-// done. Callers use this after ReadIndex to know when it's safe to read the
-// local state machine. Implemented as a short poll rather than a broadcast
-// channel - simple and correct, at the cost of up to pollInterval of added
-// latency; worth revisiting if that ever shows up in a latency budget.
-func (rn *RaftNode) WaitApplied(ctx context.Context, index uint64) error {
-	const pollInterval = 1 * time.Millisecond
-	if rn.LastApplied() >= index {
-		return nil
+// ReportApplied is called by the state machine once it has finished applying
+// the ApplyMsg at index (command or snapshot). Every consumer of applyCh must
+// call it for every message it processes - including ones it rejects as
+// malformed - or WaitApplied and Snapshot will (safely) stall at the last
+// reported index. Reports at or below the current value are ignored.
+func (rn *RaftNode) ReportApplied(index uint64) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if index <= rn.lastApplied {
+		return
 	}
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
+	rn.lastApplied = index
+	close(rn.appliedSignal)
+	rn.appliedSignal = make(chan struct{})
+}
+
+// WaitApplied blocks until the state machine has reported (ReportApplied)
+// applying at least index, or ctx is done. Callers use this after ReadIndex
+// to know when it's safe to read the local state machine.
+func (rn *RaftNode) WaitApplied(ctx context.Context, index uint64) error {
 	for {
+		rn.mu.Lock()
+		if rn.lastApplied >= index {
+			rn.mu.Unlock()
+			return nil
+		}
+		signal := rn.appliedSignal
+		rn.mu.Unlock()
+
 		select {
-		case <-ticker.C:
-			if rn.LastApplied() >= index {
-				return nil
-			}
+		case <-signal:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 }
 
+// LastApplied returns the highest index the state machine has confirmed via
+// ReportApplied.
 func (rn *RaftNode) LastApplied() uint64 {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
