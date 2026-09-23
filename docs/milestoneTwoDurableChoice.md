@@ -1,5 +1,13 @@
 # ADR: Dual-Engine Storage Architecture
 
+> **Update (2026-09-23): the on-disk layout below has been superseded.** Raft storage now owns
+> snapshots too (there is no separate Layer 2 `mvcc.snap`, and no snapshot ticker): `metadata.json`
+> is the single atomic commit point for every multi-file change, snapshots live in
+> `snap-<index>.dat`, and the WAL lives in `wal-<base>/` with a base offset so a follower can
+> install a snapshot beyond its log. The reasoning below (why `tidwall/wal`, why HardState is kept
+> outside the WAL) still holds. Current design: [architecture.md §5](architecture.md#5-durability-and-recovery).
+
+
 ## Status
 
 **Decided:** Choice A (Clean Separation / Dual-Engine Architecture).

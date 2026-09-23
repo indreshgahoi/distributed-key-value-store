@@ -2,10 +2,10 @@ goos: linux
 goarch: amd64
 pkg: github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft
 cpu: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz
-BenchmarkTidwallStorage_SequentialRead-12    	 1194812	       879.8 ns/op	    1552 B/op	      15 allocs/op
-BenchmarkTidwallStorage_SequentialRead-12    	 1276758	       899.0 ns/op	    1552 B/op	      15 allocs/op
-BenchmarkTidwallStorage_SequentialRead-12    	 1244288	       951.1 ns/op	    1552 B/op	      15 allocs/op
-BenchmarkTidwallStorage_SequentialRead-12    	 1312490	       912.6 ns/op	    1552 B/op	      15 allocs/op
-BenchmarkTidwallStorage_SequentialRead-12    	 1317734	       902.8 ns/op	    1552 B/op	      15 allocs/op
+BenchmarkTidwallStorage_SequentialRead-12    	 1215068	       863.6 ns/op	    1856 B/op	      15 allocs/op
+BenchmarkTidwallStorage_SequentialRead-12    	 1342225	       950.3 ns/op	    1856 B/op	      15 allocs/op
+BenchmarkTidwallStorage_SequentialRead-12    	 1375292	       871.1 ns/op	    1856 B/op	      15 allocs/op
+BenchmarkTidwallStorage_SequentialRead-12    	 1172394	       988.1 ns/op	    1856 B/op	      15 allocs/op
+BenchmarkTidwallStorage_SequentialRead-12    	 1158872	       986.3 ns/op	    1856 B/op	      15 allocs/op
 PASS
-ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft	11.248s
+ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft	12.676s

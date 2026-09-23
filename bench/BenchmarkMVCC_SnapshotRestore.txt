@@ -2,10 +2,10 @@ goos: linux
 goarch: amd64
 pkg: github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft
 cpu: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz
-BenchmarkMVCC_SnapshotRestore-12    	     100	  11474029 ns/op	67989088 B/op	   70005 allocs/op
-BenchmarkMVCC_SnapshotRestore-12    	     100	  10918215 ns/op	67988976 B/op	   70005 allocs/op
-BenchmarkMVCC_SnapshotRestore-12    	      91	  11011983 ns/op	67988978 B/op	   70005 allocs/op
-BenchmarkMVCC_SnapshotRestore-12    	     100	  11096256 ns/op	67988976 B/op	   70005 allocs/op
-BenchmarkMVCC_SnapshotRestore-12    	     100	  10954651 ns/op	67988977 B/op	   70005 allocs/op
+BenchmarkMVCC_SnapshotRestore-12    	     100	  15909937 ns/op	135142323 B/op	   60017 allocs/op
+BenchmarkMVCC_SnapshotRestore-12    	      81	  14289873 ns/op	135142208 B/op	   60017 allocs/op
+BenchmarkMVCC_SnapshotRestore-12    	      87	  14017307 ns/op	135142211 B/op	   60017 allocs/op
+BenchmarkMVCC_SnapshotRestore-12    	      87	  14552025 ns/op	135142208 B/op	   60017 allocs/op
+BenchmarkMVCC_SnapshotRestore-12    	      86	  13861853 ns/op	135142208 B/op	   60017 allocs/op
 PASS
-ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft	5.679s
+ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft	7.223s

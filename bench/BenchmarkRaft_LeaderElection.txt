@@ -2,10 +2,10 @@ goos: linux
 goarch: amd64
 pkg: github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft
 cpu: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz
-BenchmarkRaft_LeaderElection-12    	      15	  97502511 ns/op	100750706 B/op	     191 allocs/op
-BenchmarkRaft_LeaderElection-12    	      13	  96289226 ns/op	100749862 B/op	     188 allocs/op
-BenchmarkRaft_LeaderElection-12    	      13	  89493544 ns/op	100747329 B/op	     176 allocs/op
-BenchmarkRaft_LeaderElection-12    	      12	  97405647 ns/op	100748804 B/op	     181 allocs/op
-BenchmarkRaft_LeaderElection-12    	      14	 102304005 ns/op	100747656 B/op	     179 allocs/op
+BenchmarkRaft_LeaderElection-12    	      12	  84647158 ns/op	100753046 B/op	     211 allocs/op
+BenchmarkRaft_LeaderElection-12    	      13	  84839868 ns/op	100751375 B/op	     206 allocs/op
+BenchmarkRaft_LeaderElection-12    	      13	  81547151 ns/op	100751641 B/op	     206 allocs/op
+BenchmarkRaft_LeaderElection-12    	      14	  84864216 ns/op	100750860 B/op	     202 allocs/op
+BenchmarkRaft_LeaderElection-12    	      14	  84201659 ns/op	100750762 B/op	     203 allocs/op
 PASS
-ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft	8.716s
+ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft	7.746s

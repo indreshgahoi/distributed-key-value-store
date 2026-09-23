@@ -1,6 +1,9 @@
 # Distributed Key-Value Store
 
-A distributed, transactional key-value database built from scratch in Go, layer by layer — each layer independently testable and providing a specific guarantee to the layer above it. See [docs/concepts.md](docs/concepts.md) for a from-first-principles primer on *why* each layer (replication, consensus, partitioning, MVCC, clock skew, 2PC) exists.
+A distributed, transactional key-value database built from scratch in Go, layer by layer — each layer independently testable and providing a specific guarantee to the layer above it.
+
+- **[docs/architecture.md](docs/architecture.md)** — start here: how the system works end to end, the invariants and where each is enforced, durability and recovery, and how correctness is verified (including fault-injection testing and mutation checks that prove the tests catch real bugs).
+- [docs/concepts.md](docs/concepts.md) — a from-first-principles primer on *why* each layer (replication, consensus, partitioning, MVCC, clock skew, 2PC) exists.
 
 ## Roadmap
 
@@ -35,21 +38,21 @@ Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
 
 ### Milestone 2 breakdown — Single Group Raft Consensus
 
-- [x] **Leader election** (`pkg/consensus/raft`): randomized election timeouts, term-based voting, majority quorum
-  - [x] `RequestVote` / `HandleRequestVote` — candidate solicitation with Election Safety (up-to-date-log check)
-  - [x] Leader heartbeats via periodic empty `AppendEntries` to suppress follower elections
-  - [x] **Pre-Vote** (Raft §9.6): a two-phase election (trial round, then real) so an isolated node can't inflate its term or disrupt a healthy Leader on reconnect — see [docs/milestoneTwo.md §9](docs/milestoneTwo.md#9-the-pre-vote-protocol-raft-96)
-- [x] **Log replication** (`pkg/consensus/raft`): quorum-based commit, Log Matching Invariant
-  - [x] `AppendEntries` / `HandleAppendEntries` — replication with conflict detection and truncation
-  - [x] Commits only current-term entries by counting replicas (Raft Figure 8 safety)
-  - [x] Async `applyCh` decouples consensus from MVCC state-machine application
-- [x] **Network transport** (`pkg/consensus/raft/transport.go`): TCP RPC via `net/rpc`, per-peer connection reuse
-- [x] **Node daemon** (`cmd/kv-server`): HTTP client API (`/put`, `/get`, `/status`) fronting a Raft-replicated MVCC store
-- [x] **Log persistence — interface & write path** (`pkg/consensus/raft/storage.go`): pluggable `Storage` interface; every implementation calls `Save()` at every point Raft §5.2 requires (before granting a vote, before a real election, on every `AppendEntries`)
-- [x] **Log persistence — real crash durability** (`pkg/consensus/raft/storage_tidwall.go`): `TidwallStorage` persists log entries via `tidwall/wal` (fsync'd, segmented, `O(1)` truncation) and `HardState` via a separately fsync'd `metadata.json` — see the ADR at [docs/milestoneTwoDurableChoice.md](docs/milestoneTwoDurableChoice.md) for why the two are split. `NewRaftNode` replays everything durably persisted beyond the snapshot boundary back into the in-memory log *and* re-drives the state machine apply pipeline on boot, so a restart doesn't just restore Raft's bookkeeping while silently leaving Layer 2 empty. End-to-end verified by [`test_crash_recovery.sh`](test_crash_recovery.sh): write, `SIGKILL` all 3 nodes, restart, confirm the data (and cluster usability) survived.
-- [x] **Snapshotting & log compaction**: `RaftNode.Snapshot` compacts the in-memory and persisted log once Layer 2 checkpoints; `InstallSnapshot` RPC catches up a follower whose required entries were already compacted away
+- [x] **Leader election** (`election.go`): randomized timeouts, durable votes, the Election Restriction
+  - [x] **Pre-Vote** (Raft §9.6) with leader stickiness: a partitioned node can't inflate its term and depose a healthy leader on reconnect
+  - [x] **No-op on election** (§8): a new leader commits an entry from its own term before serving reads
+- [x] **Log replication** (`replication.go`): quorum commit restricted to current-term entries (Figure 8), bounded-size `AppendEntries`
+  - [x] **Fast log backtracking** (§5.3): followers return conflict hints so the leader skips a term per round trip
+- [x] **Ordered apply pipeline** (`apply.go`): one goroutine delivers committed entries in log order; `lastApplied` advances only when the state machine reports it applied an entry (`ReportApplied`)
+- [x] **Linearizable reads** (`read_index.go`): Read Index (§6.4) — current-term commit + quorum leadership check + wait for the state machine
+- [x] **Durable storage** (`storage_tidwall.go`): WAL via `tidwall/wal`, `metadata.json` as the single atomic commit point (fsync file + directory), versioned on-disk format, crash-leftover cleanup — see the design record [docs/milestoneTwoDurableChoice.md](docs/milestoneTwoDurableChoice.md) and its update in [docs/architecture.md §5](docs/architecture.md#5-durability-and-recovery)
+- [x] **Snapshots** (`snapshot.go`): log compaction; `InstallSnapshot` (one in flight per peer) durably installed on followers, keeping or discarding the log suffix per §7; on boot the snapshot is replayed to the state machine before the log
+- [x] **Fail-stop on storage errors**: a node that can't persist halts instead of acknowledging state its disk doesn't hold
+- [x] **Network transport** (`transport.go`): TCP `net/rpc`, one connection per peer (a dead peer never delays heartbeats to others)
+- [x] **Node daemon** (`cmd/kv-server`): HTTP API with leader redirects, single-writer state machine, fail-stop and graceful shutdown
+- [x] **Verification**: unit + regression tests for every bug found, deterministic protocol tests, a randomized fault-injection (chaos) test, and end-to-end scripts that `SIGKILL` a real cluster — see [docs/architecture.md §7](docs/architecture.md#7-how-correctness-is-verified)
 
-Design notes and the full test-case catalog: [docs/milestoneTwo.md](docs/milestoneTwo.md).
+Design notes and the original test-case catalog: [docs/milestoneTwo.md](docs/milestoneTwo.md).
 
 ### Milestone 3 breakdown — Multi-Raft and Range Sharding
 
@@ -67,60 +70,35 @@ Design notes and roadmap: [docs/milestoneThree.md](docs/milestoneThree.md).
 
 ```text
 distributed-key-value-store/
-├── cmd/
-│   └── kv-server/                 # ✅ Node daemon: HTTP client API + Raft-replicated MVCC store
-│       └── main.go
+├── cmd/kv-server/                 # Node daemon
+│   ├── main.go                    # wiring, fail-stop, graceful shutdown
+│   ├── config.go                  # flags + validation
+│   ├── api.go                     # HTTP API: /put /delete /get /status, leader redirect
+│   ├── proposals.go               # waits for a write to be *applied*, not just proposed
+│   ├── statemachine.go            # single writer: applies entries, snapshots, compacts the store
+│   └── command.go                 # replicated command format
 ├── pkg/
-│   ├── consensus/
-│   │   └── raft/                  # ✅ Milestone 2: single-group Raft consensus
-│   │       ├── node.go            # ✅ RaftNode: election, replication, RPC handlers
-│   │       ├── log.go             # ✅ RaftLog, Propose, GetState, Stop
-│   │       ├── config.go          # ✅ Config + timing-invariant validation
-│   │       ├── types.go           # ✅ NodeRole, LogEntry, RPC arg/reply types
-│   │       ├── transport.go       # ✅ TCPTransport over net/rpc (incl. InstallSnapshot)
-│   │       ├── storage.go         # ✅ Storage interface + KVStorage (durable HardState/log over Layer 0)
-│   │       ├── snapshot.go        # ✅ InstallSnapshot RPC arg/reply types
-│   │       ├── raft_test.go       # ✅ Election, replication, partition, failover, race tests
-│   │       ├── raft_bench_test.go # ✅ Log append & proposal throughput benchmarks
-│   │       ├── raft_snapshot_test.go       # ✅ Lagging-follower catch-up via InstallSnapshot
-│   │       ├── raft_snapshot_bench_test.go # ✅ MVCC snapshot export/restore benchmarks
-│   │       ├── storage_test.go             # ✅ KVStorage persistence & compaction test
-│   │       ├── raft_prevote_test.go        # ✅ Pre-Vote: no term inflation while isolated, stable leader survives reconnect
-│   │       ├── raft_prevote_bench_test.go  # ✅ Leader-election latency benchmark
-│   │       ├── storage_tidwall.go          # ✅ TidwallStorage: real disk-backed Storage (tidwall/wal + fsync'd metadata.json)
-│   │       ├── storage_tidwall_test.go     # ✅ Crash-replay, conflict-truncation, O(1) compaction test
-│   │       ├── storage_tidwall_bench_test.go # ✅ Append & sequential-read benchmarks
-│   │       └── raft_persistence_test.go    # ✅ RaftNode actually replays storage into rn.log + re-applies to Layer 2 on boot
-│   │
-│   ├── sharding/                  # 🚧 Milestone 3: Multi-Raft and range sharding
-│   │   ├── types.go               # ✅ RangeDescriptor: bounds, peers, cached leader; Contains/Validate/Clone
-│   │   ├── router.go              # ✅ RangeRouter: O(log N) binary-search routing over sorted disjoint ranges
-│   │   ├── router_test.go         # ✅ Exact-boundary, gap/overlap-rejection, and concurrent read+update race tests
-│   │   └── router_bench_test.go   # ✅ FindRange throughput at 1,000 and 10,000 ranges
-│   │
-│   ├── storage/
-│   │   ├── raw/                   # ✅ Layer 0: raw ordered byte storage engine
-│   │   │   ├── engine.go          # ✅ Interfaces: ByteEngine, Iterator
-│   │   │   ├── skiplist.go        # ✅ Lock-free concurrent skip list + arena allocator
-│   │   │   └── skiplist_test.go   # ✅ Unit, ordering, seek, and concurrency/race tests
-│   │   │
-│   │   ├── codec/                 # ✅ Layer 1: binary encoding & serialization
-│   │   │   ├── key.go             # ✅ Memcmp-safe key escaping, ^ts packing
-│   │   │   ├── value.go           # ✅ Value encoding (OpType headers, payloads)
-│   │   │   └── codec_test.go      # ✅ Ordering invariants, round-trip, benchmark
-│   │   │
-│   │   └── mvcc/                  # ✅ Layer 2: MVCC protocol & snapshot engine
-│   │       ├── engine.go          # ✅ MVCCStore interface, KeyValue, sentinel errors
-│   │       ├── mvcc.go            # ✅ Put/Delete/Get/Scan over Layer 0 + Layer 1
-│   │       ├── mvcc_test.go       # ✅ Isolation, tombstone, and scan-dedup tests + benchmark
-│   │       ├── gc.go              # ✅ Watermark-based compaction (CompactBelowWatermark)
-│   │       ├── gc_test.go         # ✅ Compaction correctness test
-│   │       └── snapshot.go        # ✅ Export/import + atomic file save/load for Raft snapshots
-│   │
-│   └── common/                    # planned
-│       └── errors.go              # Domain-specific errors (KeyNotFound, StaleWrite)
-├── go.mod
-└── go.sum
+│   ├── consensus/raft/            # Milestone 2: Raft (file-by-file map in docs/architecture.md §4)
+│   │   ├── node.go                # RaftNode, recovery, event loop, persistence, fail-stop
+│   │   ├── election.go            # Pre-Vote, elections, votes, becoming leader (+ no-op)
+│   │   ├── replication.go         # Propose, AppendEntries, fast backtracking, commit
+│   │   ├── snapshot.go            # compaction, InstallSnapshot
+│   │   ├── apply.go               # ordered apply pipeline, ReportApplied / WaitApplied
+│   │   ├── read_index.go          # linearizable reads
+│   │   ├── log.go                 # in-memory log with snapshot sentinel
+│   │   ├── storage.go             # Storage contract
+│   │   ├── storage_tidwall.go     # on-disk Storage (WAL + atomic metadata)
+│   │   ├── storage_kv.go          # Storage over a Layer 0 engine (used by tests)
+│   │   ├── transport.go, rpc.go   # TCP RPC and message types
+│   │   ├── chaos_test.go          # randomized fault-injection test
+│   │   └── *_test.go              # unit, regression, and protocol tests
+│   ├── sharding/                  # 🚧 Milestone 3: range descriptors + O(log N) router
+│   └── storage/
+│       ├── raw/                   # Layer 0: lock-free skiplist on an arena allocator
+│       ├── codec/                 # Layer 1: order-preserving key/value encoding
+│       └── mvcc/                  # Layer 2: versioned store, checksummed snapshots, compaction
+├── test_cluster.sh                # end-to-end smoke test over real HTTP/TCP
+└── test_crash_recovery.sh         # SIGKILL every node, restart, verify data survived
 ```
 
 ## Getting started
@@ -141,7 +119,7 @@ go build -o kv-server ./cmd/kv-server
 ```
 ### Run the KV server
 
-Each node persists its state under `data/node_<id>/` by default (`--data-dir` to change the base, or `--node-dir` to override the path entirely) — see [docs/milestoneTwoDurableChoice.md](docs/milestoneTwoDurableChoice.md) for the on-disk layout.
+Each node persists its Raft state under `data/node_<id>/raft/` by default (`--data-dir` to change the base, or `--node-dir` to override the path entirely) — layout in [docs/architecture.md §5](docs/architecture.md#5-durability-and-recovery). Add `--http-peers=1=127.0.0.1:9001,2=127.0.0.1:9002,3=127.0.0.1:9003` so followers can redirect clients to the leader (`307` + `Location`); without it they answer `503` with the leader's ID.
 
 Terminal 1
 ```bash
@@ -179,13 +157,13 @@ Terminal 3
   --election-timeout-max=240ms
 ```
 
-status:
+Use it:
 ```bash
-for port in 9001 9002 9003; do
-  echo -n "Port $port: "
-  curl -s http://localhost:$port/status
-  echo ""
-done
+curl -s -X POST localhost:9001/put -d '{"key":"greeting","value":"hello"}'   # write (on the leader)
+curl -s 'localhost:9001/get?key=greeting'                                     # linearizable read (leader)
+curl -s 'localhost:9002/get?key=greeting&consistency=stale'                   # local read, any node
+curl -s -X POST localhost:9001/delete -d '{"key":"greeting"}'                 # delete
+for port in 9001 9002 9003; do curl -s localhost:$port/status; done           # role, term, commit/applied index
 ```
 
 ### Automated cluster smoke test
@@ -197,10 +175,11 @@ done
 ```
 
 What it checks, in order:
-1. **Leader election** — polls `/status` on all three ports once (after a fixed 1s warm-up) and fails if no node reports `is_leader:true`.
-2. **Write proposal** — `POST /put` on the leader and asserts the response is `"status":"proposed"`.
-3. **Replication** — `GET /get` on all three ports and asserts every node returns the same written value.
-4. **Follower redirect** — `POST /put` on a follower and asserts it's rejected with HTTP `307` (not the leader, so it must not accept writes).
+1. **Leader election** — polls `/status` on all three ports (after a fixed 1s warm-up) and fails if no node reports `is_leader:true`.
+2. **Write** — `POST /put` on the leader returns `"status":"committed"` (only once the write is applied).
+3. **Replication** — a local (`consistency=stale`) read on every node returns the value.
+4. **Linearizable reads** — served by the leader; `curl -L` via a follower follows its redirect.
+5. **Follower redirect** — `POST /put` on a follower returns `307` pointing at the leader.
 
 It always cleans up after itself (`trap cleanup EXIT`): kills all three background server processes and removes the built binary and `data/` directory, even if an assertion fails partway through and the script exits early via `set -e`.
 
@@ -212,7 +191,7 @@ It always cleans up after itself (`trap cleanup EXIT`): kills all three backgrou
 ./test_crash_recovery.sh
 ```
 
-Deliberately does **not** wait for the 30-second snapshot ticker — recovery here depends entirely on Raft's WAL replay on boot (see the checklist entry above), which is the path that covers everything written since the last snapshot and matters most in practice.
+It runs with `--snapshot-every=3`, so recovery exercises both paths: each node's empty in-memory store is rebuilt from its latest snapshot, then from the WAL entries after it.
 
 This is a smoke test, not a substitute for `pkg/consensus/raft`'s test suite — it has no partition/failover coverage and only checks the happy path over a real network stack. Its value is specifically that it exercises the parts the in-process simulated-network tests can't: the actual `cmd/kv-server` binary, its flag parsing, the real `TCPTransport`/`net/rpc` wiring, and the HTTP client API — which is exactly where the peer-address bug (main.go's `--peers` parsing) and the heartbeat-interval unit bug were originally found.
 
@@ -222,8 +201,12 @@ This is a smoke test, not a substitute for `pkg/consensus/raft`'s test suite —
 # Full unit test suite, verbose
 go test -v ./...
 
-# Race detector across all packages
+# Race detector across all packages (includes a short chaos run)
 go test -race ./...
+
+# Longer randomized fault-injection soak; a failure prints its seed
+RAFT_CHAOS_SEEDS=10 RAFT_CHAOS_SECONDS=6 go test -run TestRaft_Chaos -v ./pkg/consensus/raft/
+RAFT_CHAOS_SEED=<seed> go test -run TestRaft_Chaos -v ./pkg/consensus/raft/   # replay one
 
 # Benchmarks: throughput and allocations
 go test -bench=BenchmarkSkipList_ConcurrentReads -benchmem -run='^$' -v ./pkg/storage/raw/...
@@ -232,7 +215,7 @@ go test -bench=BenchmarkMVCC_SnapshotPointGet -benchmem -run='^$' -v ./pkg/stora
 go test -bench=BenchmarkRaft_LogAppend -benchmem -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkRaft_SequentialProposals -benchmem -run='^$' -v ./pkg/consensus/raft/...
 # BenchmarkRaft_ConcurrentProposals needs a fixed -benchtime — default adaptive
-# scaling exhausts the test cluster's arena and panics the binary. See below.
+# scaling fills the test cluster's fixed-size storage arena. See below.
 go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=600x -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkMVCC_SnapshotExport -benchmem -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkMVCC_SnapshotRestore -benchmem -run='^$' -v ./pkg/consensus/raft/...
@@ -261,13 +244,13 @@ Benchmark baselines are committed under [bench/](bench/) so throughput and alloc
 | 1 — `codec` | 0 B/op, 0 allocs/op (`EncodeKeyAppend` with reused buffer) | [bench/BenchmarkCodec_ZeroAllocEncode.txt](bench/BenchmarkCodec_ZeroAllocEncode.txt) |
 | 2 — `mvcc` | ~200 ns/op, 96 B/op, 4 allocs/op (snapshot `Get` resolving the newest of 10 versions) | [bench/BenchmarkMVCC_SnapshotPointGet.txt](bench/BenchmarkMVCC_SnapshotPointGet.txt) |
 | raft — log append | ~110 ns/op, 0 allocs/op (in-memory, no network) | [bench/BenchmarkRaft_LogAppend.txt](bench/BenchmarkRaft_LogAppend.txt) |
-| raft — sequential propose | ~1.25 ms/op, 68 allocs/op (full propose → quorum → commit → apply, now incl. `KVStorage` persistence) | [bench/BenchmarkRaft_SequentialProposals.txt](bench/BenchmarkRaft_SequentialProposals.txt) |
-| raft — concurrent propose | ~10-80 µs/op under contention (capped at 600 iterations, see note) | [bench/BenchmarkRaft_ConcurrentProposals.txt](bench/BenchmarkRaft_ConcurrentProposals.txt) |
-| mvcc — snapshot export | ~1.3 ms/op, ~1.37 MB/op (streaming 10,000 live keys) | [bench/BenchmarkMVCC_SnapshotExport.txt](bench/BenchmarkMVCC_SnapshotExport.txt) |
-| mvcc — snapshot restore | ~11 ms/op, ~68 MB/op (replaying 10,000 keys into a fresh store) | [bench/BenchmarkMVCC_SnapshotRestore.txt](bench/BenchmarkMVCC_SnapshotRestore.txt) |
-| raft — leader election | ~95 ms/op (time-to-first-leader on a fresh cluster, incl. the Pre-Vote round-trip) | [bench/BenchmarkRaft_LeaderElection.txt](bench/BenchmarkRaft_LeaderElection.txt) |
-| raft — WAL append (fsync'd) | ~13 ms/op (real disk fsync per `Save()` call — vs. microseconds for the old in-memory `KVStorage`) | [bench/BenchmarkTidwallStorage_Append.txt](bench/BenchmarkTidwallStorage_Append.txt) |
-| raft — WAL sequential read | ~900 ns/op (10-entry range read under concurrent load) | [bench/BenchmarkTidwallStorage_SequentialRead.txt](bench/BenchmarkTidwallStorage_SequentialRead.txt) |
+| raft — sequential propose | ~1.26 ms/op (full propose → quorum → commit → apply, incl. `KVStorage` persistence) | [bench/BenchmarkRaft_SequentialProposals.txt](bench/BenchmarkRaft_SequentialProposals.txt) |
+| raft — concurrent propose | ~29 µs/op under contention (capped at 600 iterations, see note) | [bench/BenchmarkRaft_ConcurrentProposals.txt](bench/BenchmarkRaft_ConcurrentProposals.txt) |
+| mvcc — snapshot export | ~0.9 ms/op (streaming 10,000 live keys, buffered + CRC-32C) | [bench/BenchmarkMVCC_SnapshotExport.txt](bench/BenchmarkMVCC_SnapshotExport.txt) |
+| mvcc — snapshot restore | ~14 ms/op (10,000 keys into a fresh engine, verified, then swapped in — replaces state rather than merging) | [bench/BenchmarkMVCC_SnapshotRestore.txt](bench/BenchmarkMVCC_SnapshotRestore.txt) |
+| raft — leader election | ~85 ms/op (time-to-first-leader on a fresh cluster, incl. the Pre-Vote round-trip) | [bench/BenchmarkRaft_LeaderElection.txt](bench/BenchmarkRaft_LeaderElection.txt) |
+| raft — WAL append (fsync'd) | ~6.4 ms/op (one fsync per `Save()`; unchanged HardState is no longer rewritten — was ~13 ms with two) | [bench/BenchmarkTidwallStorage_Append.txt](bench/BenchmarkTidwallStorage_Append.txt) |
+| raft — WAL sequential read | ~950 ns/op (10-entry range read under concurrent load) | [bench/BenchmarkTidwallStorage_SequentialRead.txt](bench/BenchmarkTidwallStorage_SequentialRead.txt) |
 
 Layer 2's `Get` isn't zero-allocation like the layers below it — it allocates a seek-key buffer, a key-decode scratch buffer, and clones the returned payload to protect the caller from the storage engine's internal memory. That's expected at this layer, not a regression.
 
