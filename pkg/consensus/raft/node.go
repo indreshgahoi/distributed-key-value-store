@@ -415,7 +415,7 @@ func (rn *RaftNode) broadcastAppendEntriesLocked() {
 		// FOLLOWER COMPACTION CHECK:
 		// If peer needs an entry that has already been discarded, send InstallSnapshot!
 		if prevIndex < firstAvailable-1 {
-			go rn.sendSnapshotLocked(peer)
+			go rn.sendSnapshotAsync(peer)
 			continue
 		}
 		prevTerm, _ := rn.log.TermAt(prevIndex)
@@ -464,7 +464,16 @@ func (rn *RaftNode) broadcastAppendEntriesLocked() {
 	}
 }
 
-func (rn *RaftNode) sendSnapshotLocked(target uint64) {
+// sendSnapshotAsync sends InstallSnapshot to a lagging follower. Despite
+// being launched via `go` from broadcastAppendEntriesLocked while the
+// caller still holds rn.mu, this is safe and not reentrant: it acquires
+// rn.mu itself (in its own goroutine, blocking harmlessly until the caller
+// releases it) only to snapshot the fields it needs, then releases it
+// before the network round-trip. Named _Async rather than _Locked (unlike
+// every other ...Locked method here, which requires the CALLER to already
+// hold rn.mu) since it manages its own locking and must never be called
+// while already holding the lock on the same goroutine.
+func (rn *RaftNode) sendSnapshotAsync(target uint64) {
 	rn.mu.Lock()
 	args := &InstallSnapshotArgs{
 		Term:              rn.currentTerm,
@@ -680,6 +689,138 @@ func (rn *RaftNode) Propose(command []byte) (uint64, uint64, bool) {
 	_ = rn.storage.Save(HardState{Term: rn.currentTerm, Vote: rn.votedFor, Commit: rn.commitIndex}, []LogEntry{entry})
 	rn.broadcastAppendEntriesLocked()
 	return entry.Index, entry.Term, true
+}
+
+// ReadIndex implements Raft's Read Index protocol (§6.4) so a client can
+// serve a linearizable read straight from the local state machine without
+// paying the cost of a full log append. A leader that's been partitioned
+// into a minority island has no way to learn it was deposed on its own -
+// nothing tells it to step down while it's cut off - so serving a read
+// straight from local state the instant a request arrives could return
+// data that's already stale by the time it reaches the client. Before
+// trusting its own state, the leader must first get a quorum of peers to
+// freshly confirm, via a real round-trip, that they still recognize it as
+// leader in the current term.
+//
+// On success, ReadIndex returns the commitIndex at the moment the quorum
+// check began. Once the caller observes LastApplied() >= that index, any
+// subsequent local read against the state machine is linearizable.
+func (rn *RaftNode) ReadIndex(ctx context.Context) (uint64, error) {
+	rn.mu.Lock()
+	if rn.role != RoleLeader {
+		rn.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+	readIndex := rn.commitIndex
+	term := rn.currentTerm
+	peers := rn.cfg.Peers
+	rn.mu.Unlock()
+
+	quorum := len(peers)/2 + 1
+	if quorum <= 1 {
+		// Single-node "cluster": no peer can ever contradict us.
+		return readIndex, nil
+	}
+
+	acks := make(chan bool, len(peers)-1)
+	for _, peer := range peers {
+		if peer == rn.cfg.NodeID {
+			continue
+		}
+		go func(target uint64) {
+			rn.mu.Lock()
+			if rn.role != RoleLeader || rn.currentTerm != term {
+				rn.mu.Unlock()
+				acks <- false
+				return
+			}
+			prevIndex := rn.nextIndex[target] - 1
+			prevTerm, _ := rn.log.TermAt(prevIndex)
+			args := &AppendEntriesArgs{
+				Term:         term,
+				LeaderID:     rn.cfg.NodeID,
+				PrevLogIndex: prevIndex,
+				PrevLogTerm:  prevTerm,
+				Entries:      nil, // probe-only: this round trip exists to confirm leadership, not to replicate
+				LeaderCommit: rn.commitIndex,
+			}
+			rn.mu.Unlock()
+
+			rpcCtx, cancel := context.WithTimeout(ctx, rn.cfg.RPCTimeout)
+			reply, err := rn.transport.SendAppendEntries(rpcCtx, target, args)
+			cancel()
+			if err != nil {
+				acks <- false
+				return
+			}
+			if reply.Term > term {
+				// A higher term means we've been deposed - step down for
+				// real, not just for the purposes of this read.
+				rn.mu.Lock()
+				if reply.Term > rn.currentTerm {
+					rn.currentTerm = reply.Term
+					rn.role = RoleFollower
+					rn.votedFor = 0
+					_ = rn.storage.Save(HardState{Term: rn.currentTerm, Vote: 0, Commit: rn.commitIndex}, nil)
+					rn.resetElectionTimerLocked()
+				}
+				rn.mu.Unlock()
+				acks <- false
+				return
+			}
+			// Any reply at our term or lower - Success or not - proves this
+			// peer still accepts RPCs from us as leader. A false Success
+			// only signals a log-matching gap (replication lag), which is
+			// orthogonal to whether our leadership is still recognized.
+			acks <- true
+		}(peer)
+	}
+
+	acked := 1 // self
+	for i := 0; i < len(peers)-1; i++ {
+		select {
+		case ok := <-acks:
+			if ok {
+				acked++
+				if acked >= quorum {
+					rn.mu.Lock()
+					stillLeader := rn.role == RoleLeader && rn.currentTerm == term
+					rn.mu.Unlock()
+					if !stillLeader {
+						return 0, ErrNotLeader
+					}
+					return readIndex, nil
+				}
+			}
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return 0, ErrQuorumUnreachable
+}
+
+// WaitApplied blocks until LastApplied() reaches at least index, or ctx is
+// done. Callers use this after ReadIndex to know when it's safe to read the
+// local state machine. Implemented as a short poll rather than a broadcast
+// channel - simple and correct, at the cost of up to pollInterval of added
+// latency; worth revisiting if that ever shows up in a latency budget.
+func (rn *RaftNode) WaitApplied(ctx context.Context, index uint64) error {
+	const pollInterval = 1 * time.Millisecond
+	if rn.LastApplied() >= index {
+		return nil
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if rn.LastApplied() >= index {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (rn *RaftNode) LastApplied() uint64 {

@@ -193,6 +193,10 @@ The tests run against an in-process `SimulatedNetwork` (`raft_test.go`) rather t
 | `TestRaft_PreVoteProtectsStableLeaderOnReconnect` | The same isolation-then-reconnect scenario, but asserting on the *Leader* instead: it stays Leader at the same term throughout, for a full second after the isolated node reconnects. This is the exact scenario that made `TestRaft_InstallSnapshotToLaggingFollower` flaky (see below) — now a dedicated regression test. |
 | `TestStorage_TidwallStorage_CrashReplayAndCompaction` | `TidwallStorage` (the real disk-backed `Storage` implementation, `storage_tidwall.go`) persists `HardState` and log entries across a close+reopen of the same directory, correctly truncates conflicting entries on overwrite, and compacts via `CreateSnapshot`. Storage-layer only — doesn't touch `RaftNode`. |
 | `TestRaft_NodeReplaysLogFromStorageOnRestart` | The integration-level counterpart: boots a `RaftNode` over a `TidwallStorage` directory that already has durably-persisted entries from a "previous process," and asserts the new node's **in-memory** `rn.log`/`commitIndex` actually reflect them. `TestStorage_TidwallStorage_CrashReplayAndCompaction` alone doesn't prove this — the storage layer can be perfectly correct while `RaftNode` never bothers to read it back on boot, which is exactly the bug this test caught (see the note below). |
+| `TestRaft_NodeReplaysLogFromStorageAfterSnapshotOnRestart` | The persistence + compaction combination none of the other tests cover: a node that snapshotted, had more entries written after the snapshot boundary, then restarted. Asserts the replayed log reaches the correct index and that a fresh `Propose()` immediately after restart returns the right next index — this is the exact on-disk shape (`SnapMeta.last_included_index` plus later WAL entries) the original live-testing bug report's `metadata.json` showed. |
+| `TestRaft_ProposeAfterSnapshotCompactionUsesCorrectIndex` | Regression test for a bug found via live manual testing, not by any prior automated test: `RaftLog.Append` computed a new entry's index as `len(l.entries)`, correct only before any compaction ever happened. Once `CompactLog` repositions `entries[0]` to the snapshot boundary, that silently returns an index too low by `entries[0].Index` — two different `Propose()` calls immediately after a snapshot returned the *same* index, and the second command became unreadable. `TruncateAndAppend` (the follower-side replication path) had the identical class of bug. |
+| `TestRaftLog_TermAt_HugeIndexReturnsFalseNotPanic`, `TestRaftLog_Slice_HugeIndexReturnsNilNotPanic` | A second, independent bug surfaced while writing the test above: `toSliceIndex` converted a `uint64` offset to `int` *before* bounds-checking it, so a huge underflowed index (e.g. a caller computing `nextIndex-1` with `nextIndex==0`) wrapped to a negative `int` that slipped past the `idx >= len(entries)` guard and panicked on the slice access instead of returning "not found." Fixed by comparing in `uint64` space first. |
+| `TestRaft_ReadIndex_HealthyLeaderSucceeds`, `TestRaft_ReadIndex_NonLeaderRejectedImmediately`, `TestRaft_ReadIndex_PartitionedLeaderCannotConfirmQuorum` | Cover `RaftNode.ReadIndex` (§10 below): a healthy leader confirms and returns a usable index; a follower is rejected immediately; and — the direct regression test for the stale-read hazard — a leader isolated into a minority island (via `SimulatedNetwork.Partition`, after the majority side elects a real new leader) fails to confirm quorum instead of returning a value, proving stale reads are actually blocked rather than silently served. |
 
 Eight benchmarks measure the hot paths directly (`raft_bench_test.go`, `raft_snapshot_bench_test.go`, `raft_prevote_bench_test.go`, `storage_tidwall_bench_test.go`):
 - `BenchmarkRaft_LogAppend` — raw in-memory log append, no network involved.
@@ -445,3 +449,30 @@ Node 3’s term never increments.
 Node 1 remains the Leader, undisturbed.
 
 When the leader's next periodic heartbeat arrives at Node 3, Node 3 realizes Node 1 is alive and transitions back to RoleFollower.
+
+## 10. Linearizable Reads & Synchronous Commit (Client API Hardening)
+
+Everything above makes the *replicated log* correct. Two gaps remained in `cmd/kv-server`'s HTTP layer on top of it, both found in a principal-engineer review pass over the finished consensus engine.
+
+### The stale-read hazard
+
+The original `/get` handler read straight from the local MVCC store:
+
+```go
+readTS := uint64(time.Now().UnixNano())
+val, err := store.Get([]byte(key), readTS)
+```
+
+This is unsafe. A Leader partitioned into a minority island has no way to learn on its own that it's been deposed — nothing tells it to step down while it's cut off — so it keeps believing `GetState()` says `isLeader: true` forever. Any client that can still reach it would get served reads from a state machine that's stopped receiving new commits the instant the partition happened, silently violating linearizability.
+
+`RaftNode.ReadIndex` (`node.go`) implements the Read Index protocol (Raft §6.4): before trusting its own state, the Leader captures its current `commitIndex`, then sends a fresh round of probe `AppendEntries` RPCs (empty `Entries` — this round-trip exists purely to confirm leadership, not to replicate) and waits for a quorum of replies at its own term or lower. Only once a quorum has freshly confirmed this node is still their Leader does `ReadIndex` return the captured index; `RaftNode.WaitApplied` then blocks until the local state machine has actually caught up to it. `/get` now calls both before touching `store.Get`, and returns a redirect if it isn't leader, `503` if quorum can't be confirmed within the request timeout, or `504` if application lags behind. `TestRaft_ReadIndex_PartitionedLeaderCannotConfirmQuorum` is the direct regression test: it partitions the leader alone, lets the majority side elect a real new leader, confirms the old leader still (wrongly) believes it's leader locally, then asserts `ReadIndex` refuses to confirm quorum rather than returning a value.
+
+### Async-write error masking
+
+The original `/put` handler returned HTTP 200 the instant `node.Propose()` returned — which only appends to the *local* log, well before quorum replication or state-machine application. A client could be told a write "succeeded" moments before a leadership change silently discarded it.
+
+`ProposalTracker` (`main.go`) closes this: `/put` registers a channel keyed by the proposed index *and* the term `Propose()` returned, then blocks on it (bounded by a 2s timeout) instead of responding immediately. The background applier calls `proposalTracker.Notify(index, term, err)` after every committed entry actually applies to the state machine. The term check matters — if a leadership change overwrites the waiter's index with a *different* command before it commits (a normal, expected outcome of `TruncateAndAppend`), the entry that eventually does apply there carries a different term than what the original proposer expected, and `Notify` resolves the waiter with `ErrProposalSuperseded` instead of incorrectly handing it an unrelated command's success/failure. A request that times out first calls `Cancel(index)` to remove its waiter, so a proposal that never commits (e.g. a permanent partition) doesn't leak a channel in the tracker's map forever.
+
+### A reviewed-and-rejected claim
+
+The same review flagged `sendSnapshotLocked` (now `sendSnapshotAsync`) as a lock-reentrancy hazard, since `broadcastAppendEntriesLocked` launches it via `go rn.sendSnapshotLocked(peer)` while still holding `rn.mu`. Traced through: the callee acquires and releases `rn.mu` itself before the network round-trip, so the new goroutine just blocks briefly on `Lock()` until the caller's own `Unlock()` — ordinary lock contention between two different goroutines, not reentrancy (Go mutexes aren't about call-stack reentrancy) and not a deadlock (the caller doesn't wait on the spawned goroutine for anything). No behavior changed; only renamed away from the `...Locked` suffix, which this codebase otherwise reserves for functions that require the *caller* to already hold the lock — the old name was actively misleading about which contract applied here.

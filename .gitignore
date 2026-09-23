@@ -19,6 +19,9 @@ data_node*.snap
 # Runtime data: per-node persistence directory (--data-dir, default "data")
 /data/
 
+# Generated LLM-context dumps (scripts/dump_context.sh) - throwaway, not tracked
+/context/
+
 # Go build cache artifacts if ever vendored locally
 /vendor/
 

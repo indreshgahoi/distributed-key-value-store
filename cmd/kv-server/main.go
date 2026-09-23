@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,12 +14,19 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft"
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/storage/mvcc"
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/storage/raw"
 )
+
+// clientRequestTimeout bounds how long a /put waits for its proposal to
+// commit+apply, and how long a /get waits to confirm leadership + catch up
+// to a linearizable read index, before failing the HTTP request rather than
+// hanging forever on a stalled quorum.
+const clientRequestTimeout = 2 * time.Second
 
 type PutRequest struct {
 	Key   string `json:"key"`
@@ -28,6 +37,79 @@ type CommandPayload struct {
 	Op    string `json:"op"`
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+// ErrProposalSuperseded is returned to a /put waiter when the log index it
+// registered against ended up holding a different entry than the one it
+// proposed - i.e. a leadership change overwrote it before it committed. The
+// original command's fate is unknown (it may never have been seen by a
+// majority); the client must retry rather than be told it succeeded.
+var ErrProposalSuperseded = errors.New("proposal was superseded by a leadership change before it committed")
+
+// proposalWaiter pairs a notification channel with the term the proposer
+// expected to see reflected back - the only way to tell "my command
+// committed" apart from "a different command ended up at this index" once a
+// leadership change is possible.
+type proposalWaiter struct {
+	term uint64
+	ch   chan error
+}
+
+// ProposalTracker lets the /put HTTP handler block until its specific
+// proposal is actually applied to the state machine (not just accepted
+// locally), instead of returning success the instant Propose() appends to
+// the local log - before quorum replication or application has happened.
+type ProposalTracker struct {
+	mu      sync.Mutex
+	waiters map[uint64]proposalWaiter
+}
+
+func NewProposalTracker() *ProposalTracker {
+	return &ProposalTracker{waiters: make(map[uint64]proposalWaiter)}
+}
+
+// Register records interest in index committing at the given term and
+// returns a channel that receives exactly one value once Notify(index, ...)
+// fires for it.
+func (pt *ProposalTracker) Register(index, term uint64) chan error {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	ch := make(chan error, 1)
+	pt.waiters[index] = proposalWaiter{term: term, ch: ch}
+	return ch
+}
+
+// Cancel removes a waiter without notifying it - used when the HTTP request
+// times out first, so a proposal that never commits doesn't leak its
+// channel in the map forever.
+func (pt *ProposalTracker) Cancel(index uint64) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	delete(pt.waiters, index)
+}
+
+// Notify resolves the waiter registered for index, if any. actualTerm is
+// the term of whatever entry actually ended up applied at that index; if it
+// doesn't match what Register saw, this index's original proposal was
+// overwritten by a leadership change before it committed, and the waiter is
+// told that explicitly instead of being handed an unrelated command's
+// success/failure.
+func (pt *ProposalTracker) Notify(index, actualTerm uint64, err error) {
+	pt.mu.Lock()
+	w, ok := pt.waiters[index]
+	if !ok {
+		pt.mu.Unlock()
+		return
+	}
+	delete(pt.waiters, index)
+	pt.mu.Unlock()
+
+	if w.term != actualTerm {
+		w.ch <- ErrProposalSuperseded
+	} else {
+		w.ch <- err
+	}
+	close(w.ch)
 }
 
 // On-disk layout for a node's persistent state, rooted at --data-dir
@@ -140,6 +222,7 @@ func main() {
 	log.Printf("[Node %d] Consensus engine running on %s", *nodeID, *raftAddr)
 
 	// 10. Background state-machine applier.
+	proposalTracker := NewProposalTracker()
 	go func() {
 		for msg := range applyCh {
 			// Snapshot installations from the Leader (InstallSnapshot RPC).
@@ -160,14 +243,20 @@ func main() {
 			}
 
 			commitTS := msg.CommandIndex * 10
+			var applyErr error
 			switch cmd.Op {
 			case "PUT":
-				_ = store.Put([]byte(cmd.Key), []byte(cmd.Value), commitTS)
+				applyErr = store.Put([]byte(cmd.Key), []byte(cmd.Value), commitTS)
 				log.Printf("[State Machine] Applied Index %d: PUT %s = %s (TS: %d)", msg.CommandIndex, cmd.Key, cmd.Value, commitTS)
 			case "DELETE":
-				_ = store.Delete([]byte(cmd.Key), commitTS)
+				applyErr = store.Delete([]byte(cmd.Key), commitTS)
 				log.Printf("[State Machine] Applied Index %d: DELETE %s (TS: %d)", msg.CommandIndex, cmd.Key, commitTS)
 			}
+			// Wake up any /put handler blocked on this index - a no-op if
+			// nobody's waiting (e.g. this entry arrived via normal
+			// replication on a follower, or the HTTP request already timed
+			// out and canceled its wait).
+			proposalTracker.Notify(msg.CommandIndex, msg.CommandTerm, applyErr)
 		}
 	}()
 
@@ -213,19 +302,68 @@ func main() {
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "proposed",
-			"index":  idx,
-			"term":   term,
-			"leader": true,
-		})
+		// Propose() only appends to this node's local log - it returns
+		// immediately, well before quorum replication or state-machine
+		// application. Returning success here would let a client observe a
+		// "successful" write that a concurrent leadership change then
+		// silently discards. Block until the applier actually processes
+		// this exact index (proposalTracker.Notify, wired above) instead.
+		waitCh := proposalTracker.Register(idx, term)
+		ctx, cancel := context.WithTimeout(r.Context(), clientRequestTimeout)
+		defer cancel()
+
+		select {
+		case applyErr := <-waitCh:
+			if applyErr != nil {
+				status := http.StatusInternalServerError
+				if errors.Is(applyErr, ErrProposalSuperseded) {
+					status = http.StatusConflict
+				}
+				http.Error(w, applyErr.Error(), status)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "committed",
+				"index":  idx,
+				"term":   term,
+			})
+		case <-ctx.Done():
+			proposalTracker.Cancel(idx)
+			http.Error(w, "commit timeout: quorum not reached in time", http.StatusGatewayTimeout)
+		}
 	})
 
 	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Query().Get("key")
 		if key == "" {
 			http.Error(w, "key parameter is required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), clientRequestTimeout)
+		defer cancel()
+
+		// Reading straight from local state with time.Now() as the read
+		// timestamp is unsafe: a leader partitioned into a minority island
+		// has no way to learn it was deposed, and would keep serving
+		// increasingly stale reads to any client that can still reach it -
+		// a linearizability violation. ReadIndex (Raft §6.4) makes the
+		// leader confirm, via a fresh quorum round-trip, that it's still
+		// recognized as leader before trusting its own state machine;
+		// WaitApplied then blocks until that state machine has actually
+		// caught up to the confirmed index.
+		readIndex, err := node.ReadIndex(ctx)
+		if err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				http.Error(w, "Not leader. Redirect to leader.", http.StatusTemporaryRedirect)
+			} else {
+				http.Error(w, fmt.Sprintf("failed to confirm linearizable read: %v", err), http.StatusServiceUnavailable)
+			}
+			return
+		}
+		if err := node.WaitApplied(ctx, readIndex); err != nil {
+			http.Error(w, "timed out waiting for state machine to catch up", http.StatusGatewayTimeout)
 			return
 		}
 

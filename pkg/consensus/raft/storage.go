@@ -19,6 +19,16 @@ var (
 
 	// ErrSnapshotOutOfDate is returned when attempting to apply a snapshot older than current state.
 	ErrSnapshotOutOfDate = errors.New("raft/storage: snapshot is older than current storage watermark")
+
+	// ErrNotLeader is returned by leader-only operations (e.g. ReadIndex) when
+	// called against a node that is not currently the Leader.
+	ErrNotLeader = errors.New("raft: node is not the leader")
+
+	// ErrQuorumUnreachable is returned by ReadIndex when a quorum of peers
+	// could not be confirmed to still recognize this node as leader before
+	// the caller's context expired - e.g. this node is the Leader of a
+	// minority partition and doesn't know it yet.
+	ErrQuorumUnreachable = errors.New("raft: could not confirm leadership with a quorum before deadline")
 )
 
 // HardState represents the non-volatile consensus variables that MUST be persisted
