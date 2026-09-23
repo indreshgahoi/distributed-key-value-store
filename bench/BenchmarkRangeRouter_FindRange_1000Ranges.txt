@@ -1,0 +1,11 @@
+goos: linux
+goarch: amd64
+pkg: github.com/indreshgahoi/distributed-key-value-store/pkg/sharding
+cpu: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz
+BenchmarkRangeRouter_FindRange_1000Ranges-12    	20617612	        58.76 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRangeRouter_FindRange_1000Ranges-12    	19734907	        60.71 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRangeRouter_FindRange_1000Ranges-12    	19672586	        60.58 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRangeRouter_FindRange_1000Ranges-12    	19896820	        60.52 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRangeRouter_FindRange_1000Ranges-12    	19690498	        59.91 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/indreshgahoi/distributed-key-value-store/pkg/sharding	6.312s

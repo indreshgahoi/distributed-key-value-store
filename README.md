@@ -8,7 +8,7 @@ A distributed, transactional key-value database built from scratch in Go, layer 
 |---|---|---|
 | 1 | Local MVCC Storage Engine (Single Node) | ✅ Done |
 | 2 | Single Group Raft Consensus | ✅ Done |
-| 3 | Multi-Raft and Range Sharding | ⬜ Not started |
+| 3 | Multi-Raft and Range Sharding | 🚧 In progress |
 | 4 | Hybrid Logical Clock (HLC) | ⬜ Not started |
 | 5 | Multi-Range 2PC (Percolator Model) | ⬜ Not started |
 
@@ -51,6 +51,18 @@ Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
 
 Design notes and the full test-case catalog: [docs/milestoneTwo.md](docs/milestoneTwo.md).
 
+### Milestone 3 breakdown — Multi-Raft and Range Sharding
+
+- [x] **Phase 3.1 — Range descriptors & the range router** (`pkg/sharding`): `O(log N)` binary-search routing over sorted, disjoint `[StartKey, EndKey)` intervals
+  - [x] `RangeDescriptor` — range bounds, replica peers, cached leader; `Contains`/`Validate`/`Clone`
+  - [x] `RangeRouter.UpdateTable` — atomically installs a new routing table, rejecting any gap or overlap in keyspace coverage
+  - [x] `RangeRouter.FindRange` — `O(log N)` binary-search lookup, thread-safe for concurrent read-heavy client workloads
+- [ ] **Phase 3.2 — Multi-Raft node & RPC multiplexing** (`pkg/sharding/multi_node.go`): co-locate multiple independent Raft groups on one node
+- [ ] **Phase 3.3 — Dynamic range splitting via consensus** (`pkg/sharding/split.go`): `SplitCommand` proposed and committed through Raft
+- [ ] **Phase 3.4 — Server integration & multi-range client routing** (`cmd/kv-server`): requests to any node auto-route to the correct range leader
+
+Design notes and roadmap: [docs/milestoneThree.md](docs/milestoneThree.md).
+
 ## Package structure
 
 ```text
@@ -79,6 +91,12 @@ distributed-key-value-store/
 │   │       ├── storage_tidwall_test.go     # ✅ Crash-replay, conflict-truncation, O(1) compaction test
 │   │       ├── storage_tidwall_bench_test.go # ✅ Append & sequential-read benchmarks
 │   │       └── raft_persistence_test.go    # ✅ RaftNode actually replays storage into rn.log + re-applies to Layer 2 on boot
+│   │
+│   ├── sharding/                  # 🚧 Milestone 3: Multi-Raft and range sharding
+│   │   ├── types.go               # ✅ RangeDescriptor: bounds, peers, cached leader; Contains/Validate/Clone
+│   │   ├── router.go              # ✅ RangeRouter: O(log N) binary-search routing over sorted disjoint ranges
+│   │   ├── router_test.go         # ✅ Exact-boundary, gap/overlap-rejection, and concurrent read+update race tests
+│   │   └── router_bench_test.go   # ✅ FindRange throughput at 1,000 and 10,000 ranges
 │   │
 │   ├── storage/
 │   │   ├── raw/                   # ✅ Layer 0: raw ordered byte storage engine
@@ -221,6 +239,14 @@ go test -bench=BenchmarkMVCC_SnapshotRestore -benchmem -run='^$' -v ./pkg/consen
 go test -bench=BenchmarkRaft_LeaderElection -benchmem -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkTidwallStorage_Append -benchmem -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkTidwallStorage_SequentialRead -benchmem -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkRangeRouter_FindRange_1000Ranges -benchmem -run='^$' -v ./pkg/sharding/...
+go test -bench=BenchmarkRangeRouter_FindRange_10000Ranges -benchmem -run='^$' -v ./pkg/sharding/...
+```
+
+```bash
+# Sharding (Milestone 3, Phase 3.1) — routing correctness + concurrency, in isolation
+go test -v ./pkg/sharding/...
+go test -race -run TestRangeRouter_ConcurrentReadsAndUpdates ./pkg/sharding/...
 ```
 
 Raft-specific test-case catalog (what each test verifies) and a from-first-principles Raft primer: [docs/milestoneTwo.md](docs/milestoneTwo.md#6-testing--verification).
