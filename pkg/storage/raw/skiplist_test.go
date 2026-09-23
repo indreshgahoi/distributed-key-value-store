@@ -226,3 +226,45 @@ func BenchmarkSkipList_ConcurrentReads(b *testing.B) {
 		}
 	})
 }
+
+// TestSkipList_FullArenaReturnsError: running out of arena space is an error
+// the caller can handle (e.g. by compacting), not a process-killing panic.
+func TestSkipList_FullArenaReturnsError(t *testing.T) {
+	engine := NewSkipListEngine(4096)
+	var err error
+	for i := 0; i < 1000 && err == nil; i++ {
+		err = engine.Put([]byte(fmt.Sprintf("key-%04d", i)), bytes.Repeat([]byte("v"), 64))
+	}
+	if err != ErrArenaFull {
+		t.Fatalf("expected ErrArenaFull once the arena is exhausted, got %v", err)
+	}
+	// Existing data stays readable.
+	if _, err := engine.Get([]byte("key-0000")); err != nil {
+		t.Fatalf("engine unreadable after filling up: %v", err)
+	}
+}
+
+// TestSkipList_ConcurrentInsertsOfSameKeyDontDuplicate: writers racing to
+// insert the same new key must end up with exactly one node for it.
+func TestSkipList_ConcurrentInsertsOfSameKeyDontDuplicate(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		engine := NewSkipListEngine(1 << 20)
+		var wg sync.WaitGroup
+		for w := 0; w < 8; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				_ = engine.Put([]byte("contended"), []byte{byte(w)})
+			}(w)
+		}
+		wg.Wait()
+		count := 0
+		it := engine.NewIterator()
+		for it.First(); it.Valid(); it.Next() {
+			count++
+		}
+		if count != 1 {
+			t.Fatalf("round %d: expected 1 node for a key inserted concurrently, found %d", round, count)
+		}
+	}
+}

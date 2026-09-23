@@ -15,8 +15,14 @@ type GCStats struct {
 
 // CompactBelowWatermark iterates through the storage engine and purges all versions
 // that are shadowed and older than safeWatermarkTS.
+//
+// It marks dead versions logically but frees no memory (the arena engine
+// can't); use Compact to physically reclaim space.
 func (s *Store) CompactBelowWatermark(startKey, endKey []byte, safeWatermarkTS uint64) (GCStats, error) {
-	iter := s.raw.NewIterator()
+	s.rebuild.RLock()
+	defer s.rebuild.RUnlock()
+	engine := s.current()
+	iter := engine.NewIterator()
 	defer iter.Close()
 
 	// Initial seek at the start of the key range
@@ -99,7 +105,7 @@ func (s *Store) CompactBelowWatermark(startKey, endKey []byte, safeWatermarkTS u
 	// correctly invisible to Get/Scan.
 	purgedValue := codec.EncodeValueAppend(nil, codec.OpTypeDelete, nil)
 	for _, deadKey := range keysToPurge {
-		if err := s.raw.Put(deadKey, purgedValue); err != nil {
+		if err := engine.Put(deadKey, purgedValue); err != nil {
 			return stats, err
 		}
 	}

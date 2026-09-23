@@ -10,6 +10,11 @@ var (
 	ErrKeyNotFound = errors.New("mvcc: key not found or deleted at snapshot timestamp")
 	// ErrEngineClosed is returned when operations are attempted on a stopped engine.
 	ErrEngineClosed = errors.New("mvcc: storage engine is closed")
+	// ErrCorruptSnapshot is returned when a snapshot stream fails validation.
+	ErrCorruptSnapshot = errors.New("mvcc: snapshot is corrupt or truncated")
+	// ErrCannotRebuild is returned by Compact/RestoreSnapshot when the store
+	// has no way to create a fresh engine to rebuild into.
+	ErrCannotRebuild = errors.New("mvcc: engine does not support rebuilding (no EmptyCloner)")
 )
 
 // KeyValue represents a logical user entry visible at a specific snapshot.
@@ -37,9 +42,10 @@ type MVCCStore interface {
 	// Close shuts down the underlying engine.
 	Close() error
 
-	// ExportSnapshot streams all active versions <= safeWatermarkTS to an io.Writer.
+	// ExportSnapshot streams the store's state as of safeWatermarkTS (plus
+	// every version newer than it) to w.
 	ExportSnapshot(w io.Writer, safeWatermarkTS uint64) error
 
-	// RestoreSnapshot reads a binary snapshot stream and loads it into the storage engine.
+	// RestoreSnapshot replaces the store's entire contents with a snapshot.
 	RestoreSnapshot(r io.Reader) error
 }

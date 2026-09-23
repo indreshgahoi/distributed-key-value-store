@@ -10,18 +10,33 @@ import (
 const (
 	maxHeight = 20
 	branching = 4 // p = 1/4
+	nodeAlign = 8 // nodes hold 64-bit atomics, which must be 8-byte aligned
 )
 
+// node is stored inside the arena. All fields that change after the node is
+// published are read and written atomically.
 type node struct {
-	keyOffset    uint32
-	keyLen       uint32
-	valOffset    uint32
-	valLen       uint32
+	keyOffset uint32
+	keyLen    uint32
+	// value packs the value's arena offset (high 32 bits) and length (low 32
+	// bits) into one word, so a concurrent reader always sees a matching
+	// pair - never a new length with an old offset.
+	value        uint64
 	height       uint16
-	_            [6]byte // padding to align next pointers
+	_            [6]byte
 	nextPointers [maxHeight]uint64
 }
 
+var nodeSize = uint32(unsafe.Sizeof(node{}))
+
+func packValue(offset, length uint32) uint64 { return uint64(offset)<<32 | uint64(length) }
+
+func unpackValue(v uint64) (offset, length uint32) { return uint32(v >> 32), uint32(v) }
+
+// Arena is a fixed-size bump allocator: nodes, keys and values are carved
+// out of one []byte, so the skiplist creates no per-entry garbage for the
+// Go GC to trace. Memory is never freed individually; the whole arena is
+// discarded when the engine is rebuilt.
 type Arena struct {
 	buf []byte
 	off uint32
@@ -30,16 +45,36 @@ type Arena struct {
 func newArena(capacity uint32) *Arena {
 	return &Arena{
 		buf: make([]byte, capacity),
-		off: 1, // Offset 0 is null pointer
+		off: nodeAlign, // offset 0 is the null pointer
 	}
 }
 
-func (a *Arena) alloc(size uint32) uint32 {
-	offset := atomic.AddUint32(&a.off, size)
-	if offset > uint32(len(a.buf)) {
-		panic("raw: arena out of memory")
+// alloc reserves size bytes aligned to align, or reports false if the arena
+// can't fit them. Lock-free: concurrent writers race with CAS.
+func (a *Arena) alloc(size, align uint32) (uint32, bool) {
+	for {
+		old := atomic.LoadUint32(&a.off)
+		start := (uint64(old) + uint64(align) - 1) &^ (uint64(align) - 1)
+		end := start + uint64(size)
+		if end > uint64(len(a.buf)) {
+			return 0, false
+		}
+		if atomic.CompareAndSwapUint32(&a.off, old, uint32(end)) {
+			return uint32(start), true
+		}
 	}
-	return offset - size
+}
+
+// allocBytes copies b into the arena and returns its offset.
+func (a *Arena) allocBytes(b []byte) (uint32, bool) {
+	if len(b) == 0 {
+		return 0, true
+	}
+	off, ok := a.alloc(uint32(len(b)), 1)
+	if ok {
+		copy(a.buf[off:], b)
+	}
+	return off, ok
 }
 
 func (a *Arena) getBytes(offset, length uint32) []byte {
@@ -49,7 +84,9 @@ func (a *Arena) getBytes(offset, length uint32) []byte {
 	return a.buf[offset : offset+length]
 }
 
-// SkipListEngine implements Layer 0 Raw Engine
+// SkipListEngine implements Layer 0 as a lock-free concurrent skip list over
+// an arena. Writers never block readers or each other; they publish with
+// compare-and-swap and retry on contention.
 type SkipListEngine struct {
 	arena  *Arena
 	head   uint32
@@ -57,17 +94,25 @@ type SkipListEngine struct {
 	closed uint32
 }
 
+// NewSkipListEngine creates an engine with a fixed memory budget.
 func NewSkipListEngine(arenaSize uint32) *SkipListEngine {
 	arena := newArena(arenaSize)
-	// allocate head node
-	headNode := &node{height: maxHeight}
-	headOffset := arena.alloc(uint32(unsafe.Sizeof(*headNode)))
-	*(*node)(unsafe.Pointer(&arena.buf[headOffset])) = *headNode
-	return &SkipListEngine{
-		arena:  arena,
-		head:   headOffset,
-		height: 1,
+	head, ok := arena.alloc(nodeSize, nodeAlign)
+	if !ok {
+		panic("raw: arena too small for the head node")
 	}
+	*(*node)(unsafe.Pointer(&arena.buf[head])) = node{height: maxHeight}
+	return &SkipListEngine{arena: arena, head: head, height: 1}
+}
+
+// NewEmpty implements EmptyCloner.
+func (s *SkipListEngine) NewEmpty() ByteEngine {
+	return NewSkipListEngine(uint32(len(s.arena.buf)))
+}
+
+// MemoryUsage implements MemoryReporter.
+func (s *SkipListEngine) MemoryUsage() (used, capacity uint64) {
+	return uint64(atomic.LoadUint32(&s.arena.off)), uint64(len(s.arena.buf))
 }
 
 func (s *SkipListEngine) getNode(offset uint32) *node {
@@ -75,6 +120,13 @@ func (s *SkipListEngine) getNode(offset uint32) *node {
 		return nil
 	}
 	return (*node)(unsafe.Pointer(&s.arena.buf[offset]))
+}
+
+func (s *SkipListEngine) keyOf(n *node) []byte { return s.arena.getBytes(n.keyOffset, n.keyLen) }
+
+func (s *SkipListEngine) valueOf(n *node) []byte {
+	off, length := unpackValue(atomic.LoadUint64(&n.value))
+	return s.arena.getBytes(off, length)
 }
 
 func (s *SkipListEngine) randomHeight() uint16 {
@@ -85,56 +137,52 @@ func (s *SkipListEngine) randomHeight() uint16 {
 	return h
 }
 
-// findSplice requires pointer references so caller arrays receive modifications
-func (s *SkipListEngine) findSplice(key []byte, pre *[maxHeight]uint32, next *[maxHeight]uint32) {
+// findSplice fills pre/next with, at every level, the last node before key
+// and the first node at or after it.
+func (s *SkipListEngine) findSplice(key []byte, pre, next *[maxHeight]uint32) {
 	curr := s.head
-	currH := int(atomic.LoadInt32(&s.height)) - 1
-
-	for h := currH; h >= 0; h-- {
+	for h := int(atomic.LoadInt32(&s.height)) - 1; h >= 0; h-- {
 		for {
-			currNode := s.getNode(curr)
-			nextOffSet := atomic.LoadUint64(&currNode.nextPointers[h])
-			if nextOffSet == 0 {
+			nextOffset := uint32(atomic.LoadUint64(&s.getNode(curr).nextPointers[h]))
+			if nextOffset == 0 || bytes.Compare(s.keyOf(s.getNode(nextOffset)), key) >= 0 {
 				break
 			}
-			nextNode := s.getNode(uint32(nextOffSet))
-			nextKey := s.arena.getBytes(nextNode.keyOffset, nextNode.keyLen)
-
-			if bytes.Compare(nextKey, key) >= 0 {
-				break
-			}
-			curr = uint32(nextOffSet)
+			curr = nextOffset
 		}
 		pre[h] = curr
 		next[h] = uint32(atomic.LoadUint64(&s.getNode(curr).nextPointers[h]))
 	}
 }
 
+// Put inserts key or replaces its value.
 func (s *SkipListEngine) Put(key, value []byte) error {
 	if atomic.LoadUint32(&s.closed) == 1 {
 		return ErrClosed
 	}
+	valOffset, ok := s.arena.allocBytes(value)
+	if !ok {
+		return ErrArenaFull
+	}
+	packed := packValue(valOffset, uint32(len(value)))
 
 	var pre, next [maxHeight]uint32
 	s.findSplice(key, &pre, &next)
-
-	// Check if Key exists at Base Level
-	if next[0] != 0 {
-		nextNode := s.getNode(next[0])
-		existingKey := s.arena.getBytes(nextNode.keyOffset, nextNode.keyLen)
-
-		if bytes.Equal(existingKey, key) {
-			// Append-only value update to ensure concurrent readers never observe torn reads.
-			valOffset := s.arena.alloc(uint32(len(value)))
-			copy(s.arena.buf[valOffset:], value)
-			// Publish the len and offset atomically
-			atomic.StoreUint32(&nextNode.valLen, uint32(len(value)))
-			atomic.StoreUint32(&nextNode.valOffset, valOffset)
-			return nil
-		}
+	if s.updateIfPresent(next[0], key, packed) {
+		return nil
 	}
 
+	keyOffset, ok := s.arena.allocBytes(key)
+	if !ok {
+		return ErrArenaFull
+	}
+	nodeOffset, ok := s.arena.alloc(nodeSize, nodeAlign)
+	if !ok {
+		return ErrArenaFull
+	}
 	height := s.randomHeight()
+	nd := s.getNode(nodeOffset)
+	*nd = node{keyOffset: keyOffset, keyLen: uint32(len(key)), value: packed, height: height}
+
 	for {
 		currH := atomic.LoadInt32(&s.height)
 		if int32(height) <= currH || atomic.CompareAndSwapInt32(&s.height, currH, int32(height)) {
@@ -142,78 +190,73 @@ func (s *SkipListEngine) Put(key, value []byte) error {
 		}
 	}
 
-	// Allocate new Node in Arena
-	keyOffset := s.arena.alloc(uint32(len(key)))
-	copy(s.arena.buf[keyOffset:], key)
-	valueOffset := s.arena.alloc(uint32(len(value)))
-	copy(s.arena.buf[valueOffset:], value)
-
-	newNode := &node{
-		keyOffset: keyOffset,
-		keyLen:    uint32(len(key)),
-		valOffset: valueOffset,
-		valLen:    uint32(len(value)),
-		height:    height,
-	}
-	newNodeOffset := s.arena.alloc(uint32(unsafe.Sizeof(*newNode)))
-	*(*node)(unsafe.Pointer(&s.arena.buf[newNodeOffset])) = *newNode
-
-	// Link Pointer bottom up
+	// Link bottom-up: once linked at level 0 the node is visible to readers;
+	// higher levels are only shortcuts.
 	for h := uint16(0); h < height; h++ {
 		for {
 			p := pre[h]
-			n := next[h]
 			if p == 0 {
 				p = s.head
 			}
-			pNode := s.getNode(p)
-			newNodeInArena := s.getNode(newNodeOffset)
-			atomic.StoreUint64(&newNodeInArena.nextPointers[h], uint64(n))
-			if atomic.CompareAndSwapUint64(&pNode.nextPointers[h], uint64(n), uint64(newNodeOffset)) {
+			atomic.StoreUint64(&nd.nextPointers[h], uint64(next[h]))
+			if atomic.CompareAndSwapUint64(&s.getNode(p).nextPointers[h], uint64(next[h]), uint64(nodeOffset)) {
 				break
 			}
-			// try again
+			// Lost a race: recompute the splice. If a concurrent writer
+			// inserted this same key first, update its node instead of
+			// linking a duplicate (only possible before level 0 is linked).
 			s.findSplice(key, &pre, &next)
+			if h == 0 && s.updateIfPresent(next[0], key, packed) {
+				return nil
+			}
 		}
 	}
-
 	return nil
+}
+
+// updateIfPresent stores packed as the value of candidate if it holds key.
+func (s *SkipListEngine) updateIfPresent(candidate uint32, key []byte, packed uint64) bool {
+	if candidate == 0 {
+		return false
+	}
+	n := s.getNode(candidate)
+	if !bytes.Equal(s.keyOf(n), key) {
+		return false
+	}
+	atomic.StoreUint64(&n.value, packed)
+	return true
 }
 
 func (s *SkipListEngine) Get(key []byte) ([]byte, error) {
 	if atomic.LoadUint32(&s.closed) == 1 {
 		return nil, ErrClosed
 	}
+	// Hand-rolled rather than findSplice: a hit can return from whatever
+	// level it's found on instead of descending to level 0 - the hot path.
 	curr := s.head
-	currH := int(atomic.LoadInt32(&s.height)) - 1
-
-	// top to bottom search
-	for h := currH; h >= 0; h-- {
+	for h := int(atomic.LoadInt32(&s.height)) - 1; h >= 0; h-- {
 		for {
-			currNode := s.getNode(curr)
-			nextOffSet := atomic.LoadUint64(&currNode.nextPointers[h])
-			if nextOffSet == 0 {
+			nextOffset := uint32(atomic.LoadUint64(&s.getNode(curr).nextPointers[h]))
+			if nextOffset == 0 {
 				break
 			}
-			nextNode := s.getNode(uint32(nextOffSet))
-			nextKey := s.arena.getBytes(nextNode.keyOffset, nextNode.keyLen)
-
-			cmp := bytes.Compare(nextKey, key)
+			n := s.getNode(nextOffset)
+			cmp := bytes.Compare(s.keyOf(n), key)
 			if cmp == 0 {
-				return s.arena.getBytes(atomic.LoadUint32(&nextNode.valOffset),
-					atomic.LoadUint32(&nextNode.valLen)), nil
+				return s.valueOf(n), nil
 			}
 			if cmp > 0 {
 				break
 			}
-			curr = uint32(nextOffSet)
+			curr = nextOffset
 		}
 	}
 	return nil, ErrNotFound
 }
 
+// Delete clears key's value. Layer 0 has no physical removal (the node stays
+// linked with an empty value); MVCC deletes are tombstone versions instead.
 func (s *SkipListEngine) Delete(key []byte) error {
-	// Layer 0 Delete removes physical key. Layer 2 MVCC uses tombstone
 	return s.Put(key, nil)
 }
 
@@ -223,7 +266,7 @@ func (s *SkipListEngine) Close() error {
 }
 
 func (s *SkipListEngine) NewIterator() Iterator {
-	return &skiplistIterator{engine: s, curr: 0, err: nil}
+	return &skiplistIterator{engine: s}
 }
 
 type skiplistIterator struct {
@@ -232,39 +275,34 @@ type skiplistIterator struct {
 	err    error
 }
 
-func (it *skiplistIterator) Seek(target []byte) {
+func (it *skiplistIterator) checkOpen() bool {
 	if it.err != nil {
-		return
+		return false
 	}
 	if atomic.LoadUint32(&it.engine.closed) == 1 {
 		it.err = ErrClosed
 		it.curr = 0
+		return false
+	}
+	return true
+}
+
+// Seek positions the cursor at the first key >= target.
+func (it *skiplistIterator) Seek(target []byte) {
+	if !it.checkOpen() {
 		return
 	}
+	var pre, next [maxHeight]uint32
+	it.engine.findSplice(target, &pre, &next)
+	it.curr = next[0]
+}
 
-	curr := it.engine.head
-	currH := int(atomic.LoadInt32(&it.engine.height)) - 1
-
-	// top to bottom search
-	for h := currH; h >= 0; h-- {
-		for {
-			currNode := it.engine.getNode(curr)
-			nextOffSet := atomic.LoadUint64(&currNode.nextPointers[h])
-			if nextOffSet == 0 {
-				break
-			}
-			nextNode := it.engine.getNode(uint32(nextOffSet))
-			nextKey := it.engine.arena.getBytes(nextNode.keyOffset, nextNode.keyLen)
-
-			cmp := bytes.Compare(nextKey, target)
-			if cmp >= 0 {
-				break
-			}
-
-			curr = uint32(nextOffSet)
-		}
+// First positions the cursor at the smallest key.
+func (it *skiplistIterator) First() {
+	if !it.checkOpen() {
+		return
 	}
-	it.curr = uint32(atomic.LoadUint64(&it.engine.getNode(curr).nextPointers[0]))
+	it.curr = uint32(atomic.LoadUint64(&it.engine.getNode(it.engine.head).nextPointers[0]))
 }
 
 func (it *skiplistIterator) Next() {
@@ -273,44 +311,10 @@ func (it *skiplistIterator) Next() {
 	}
 }
 
-func (it *skiplistIterator) Valid() bool {
-	return it.curr != 0 && it.err == nil
-}
-
-func (it *skiplistIterator) Key() []byte {
-	n := it.engine.getNode(it.curr)
-	return it.engine.arena.getBytes(n.keyOffset, n.keyLen)
-}
-
-func (it *skiplistIterator) Value() []byte {
-	n := it.engine.getNode(it.curr)
-	return it.engine.arena.getBytes(atomic.LoadUint32(&n.valOffset), atomic.LoadUint32(&n.valLen))
-}
-
-// First positions the cursor at the first (smallest) key in the SkipList.
-func (it *skiplistIterator) First() {
-	if it.err != nil {
-		return
-	}
-	if atomic.LoadUint32(&it.engine.closed) == 1 {
-		it.err = ErrClosed
-		it.curr = 0
-		return
-	}
-
-	headNode := it.engine.getNode(it.engine.head)
-	if headNode == nil {
-		it.curr = 0
-		return
-	}
-
-	firstOffset := atomic.LoadUint64(&headNode.nextPointers[0])
-	it.curr = uint32(firstOffset)
-}
-
-func (it *skiplistIterator) Error() error {
-	return it.err
-}
+func (it *skiplistIterator) Valid() bool   { return it.curr != 0 && it.err == nil }
+func (it *skiplistIterator) Key() []byte   { return it.engine.keyOf(it.engine.getNode(it.curr)) }
+func (it *skiplistIterator) Value() []byte { return it.engine.valueOf(it.engine.getNode(it.curr)) }
+func (it *skiplistIterator) Error() error  { return it.err }
 
 func (it *skiplistIterator) Close() error {
 	it.curr = 0

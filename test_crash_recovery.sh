@@ -4,11 +4,9 @@
 # Writes to a live 3-node cluster, SIGKILLs all three processes (simulating a
 # hard crash - no graceful shutdown, no deferred cleanup), restarts them from
 # the SAME on-disk data directories, and verifies the data is still there and
-# the cluster is still usable. Deliberately does NOT wait for the 30s
-# snapshot ticker - recovery here depends entirely on Raft's WAL replay on
-# boot (pkg/consensus/raft/node.go's NewRaftNode reading storage.Entries()
-# back into the in-memory log), which is the path that matters most: it's
-# what covers everything written since the last snapshot.
+# the cluster is still usable. The in-memory store starts empty on restart,
+# so everything it holds afterwards was rebuilt by Raft: the latest snapshot
+# first, then the WAL entries after it (NewRaftNode in pkg/consensus/raft).
 set -euo pipefail
 
 echo "==> Building kv-server binary..."
@@ -26,7 +24,7 @@ cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill -9 "$pid" 2>/dev/null || true
   done
-  pkill -9 -f '^\./kv-server ' 2>/dev/null || true # belt and suspenders
+  pkill -9 -f '^\./kv-server ' 2>/dev/null || true # belt and suspenders (anchored: must not match the invoking shell)
   rm -f kv-server n1.log n2.log n3.log
   rm -rf data
 }
@@ -36,7 +34,10 @@ trap cleanup EXIT
 rm -rf data
 
 PEERS="1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003"
-FLAGS=(--peers="$PEERS" --heartbeat-interval=30ms --election-timeout-min=100ms --election-timeout-max=200ms)
+# --snapshot-every=3 makes the 5 writes below produce a snapshot, so recovery
+# exercises both paths: restoring the snapshot, then replaying the log after it.
+FLAGS=(--peers="$PEERS" --http-peers=1=127.0.0.1:9001,2=127.0.0.1:9002,3=127.0.0.1:9003
+       --snapshot-every=3 --heartbeat-interval=30ms --election-timeout-min=100ms --election-timeout-max=200ms)
 
 start_cluster() {
   PIDS=()
@@ -88,7 +89,7 @@ echo "PASS: 5 keys proposed successfully."
 echo "==> Verifying all 5 keys are readable on all 3 nodes before the crash..."
 for port in 9001 9002 9003; do
   for i in 1 2 3 4 5; do
-    res=$(curl -s "http://localhost:${port}/get?key=crash_test_key_${i}")
+    res=$(curl -s "http://localhost:${port}/get?consistency=stale&key=crash_test_key_${i}")
     if [[ "$res" != *"value_${i}"* ]]; then
       echo "FAIL pre-crash on port $port, key $i: $res"
       exit 1
@@ -121,7 +122,7 @@ echo "==> Phase 5: Verifying all 5 pre-crash keys survived on all 3 nodes..."
 failed=0
 for port in 9001 9002 9003; do
   for i in 1 2 3 4 5; do
-    res=$(curl -s "http://localhost:${port}/get?key=crash_test_key_${i}")
+    res=$(curl -s "http://localhost:${port}/get?consistency=stale&key=crash_test_key_${i}")
     if [[ "$res" != *"value_${i}"* ]]; then
       echo "FAIL post-crash on port $port, key $i: got '$res'"
       failed=1
@@ -148,7 +149,7 @@ if [[ "$res" != *"\"status\":\"committed\""* ]]; then
 fi
 sleep 0.5
 for port in 9001 9002 9003; do
-  res=$(curl -s "http://localhost:${port}/get?key=post_crash_key")
+  res=$(curl -s "http://localhost:${port}/get?consistency=stale&key=post_crash_key")
   if [[ "$res" != *"still_alive"* ]]; then
     echo "FAIL: post-restart write not replicated to port $port: $res"
     exit 1
