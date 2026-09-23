@@ -16,6 +16,9 @@ coverage.html
 data_node*.snap
 *.snap.tmp
 
+# Runtime data: per-node persistence directory (--data-dir, default "data")
+/data/
+
 # Go build cache artifacts if ever vendored locally
 /vendor/
 

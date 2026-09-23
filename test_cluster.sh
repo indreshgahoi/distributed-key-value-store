@@ -8,8 +8,14 @@ cleanup() {
   echo "==> Shutting down cluster processes..."
   kill $(jobs -p) 2>/dev/null || true
   rm -f kv-server
+  rm -rf data
 }
 trap cleanup EXIT
+
+# Nodes now persist real state to ./data/node_<id>/ (Raft WAL + MVCC snapshot).
+# Clear any leftovers from a prior run first, so this stays a clean, isolated
+# smoke test rather than silently depending on state a previous run left behind.
+rm -rf data
 
 echo "==> Starting 3-node cluster in background..."
 ./kv-server --id=1 --raft-addr=127.0.0.1:8001 --http-addr=:9001 \

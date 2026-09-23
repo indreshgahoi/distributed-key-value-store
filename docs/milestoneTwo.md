@@ -191,14 +191,23 @@ The tests run against an in-process `SimulatedNetwork` (`raft_test.go`) rather t
 | `TestStorage_KVStorage_PersistenceAndTruncation` | `KVStorage` (the `Storage` implementation over Layer 0) persists `HardState` and log entries, correctly truncates conflicting entries on overwrite, and `CreateSnapshot` compacts entries before the watermark so they return `ErrCompacted`. |
 | `TestRaft_PreVoteBlocksTermInflationWhileIsolated` | A node disconnected through 600ms of isolation (several election-timeout cycles) never advances `currentTerm` — `startRealElectionLocked` (the only place `currentTerm++` happens) is only reached after winning a Pre-Vote quorum, which an isolated node can never do. |
 | `TestRaft_PreVoteProtectsStableLeaderOnReconnect` | The same isolation-then-reconnect scenario, but asserting on the *Leader* instead: it stays Leader at the same term throughout, for a full second after the isolated node reconnects. This is the exact scenario that made `TestRaft_InstallSnapshotToLaggingFollower` flaky (see below) — now a dedicated regression test. |
+| `TestStorage_TidwallStorage_CrashReplayAndCompaction` | `TidwallStorage` (the real disk-backed `Storage` implementation, `storage_tidwall.go`) persists `HardState` and log entries across a close+reopen of the same directory, correctly truncates conflicting entries on overwrite, and compacts via `CreateSnapshot`. Storage-layer only — doesn't touch `RaftNode`. |
+| `TestRaft_NodeReplaysLogFromStorageOnRestart` | The integration-level counterpart: boots a `RaftNode` over a `TidwallStorage` directory that already has durably-persisted entries from a "previous process," and asserts the new node's **in-memory** `rn.log`/`commitIndex` actually reflect them. `TestStorage_TidwallStorage_CrashReplayAndCompaction` alone doesn't prove this — the storage layer can be perfectly correct while `RaftNode` never bothers to read it back on boot, which is exactly the bug this test caught (see the note below). |
 
-Six benchmarks measure the hot paths directly (`raft_bench_test.go`, `raft_snapshot_bench_test.go`, `raft_prevote_bench_test.go`):
+Eight benchmarks measure the hot paths directly (`raft_bench_test.go`, `raft_snapshot_bench_test.go`, `raft_prevote_bench_test.go`, `storage_tidwall_bench_test.go`):
 - `BenchmarkRaft_LogAppend` — raw in-memory log append, no network involved.
 - `BenchmarkRaft_SequentialProposals` — full propose → quorum replicate → commit → apply latency on a 3-node cluster, now including `KVStorage` persistence on every step.
 - `BenchmarkRaft_ConcurrentProposals` — proposal throughput under concurrent write pressure. **Must be run with a fixed `-benchtime` (e.g. `-benchtime=600x`)** — left to Go's default adaptive scaling, it proposes enough unique keys to exhaust the test cluster's fixed-size Layer 0 arena and panics the whole binary (a known Layer 0 limitation: no reclamation, see [bench/README.md](../bench/README.md)). This cap dropped from 2000x to 600x once persistence landed, since every `AppendEntries` now also writes into the raft node's own storage arena on top of the MVCC arena.
 - `BenchmarkMVCC_SnapshotExport` — Layer 2 export throughput streaming 10,000 live keys.
 - `BenchmarkMVCC_SnapshotRestore` — ingestion throughput replaying a 10,000-key snapshot into a fresh store.
 - `BenchmarkRaft_LeaderElection` — time-to-first-leader on a fresh 3-node cluster. None of the other benchmarks touch the election path at all (they measure steady-state proposing after a leader already exists), and Pre-Vote's entire cost is one extra RPC round-trip specifically in that path, so this is the one that actually reflects it. ~95ms/op, dominated by the randomized 60-120ms election timeout itself.
+- `BenchmarkTidwallStorage_Append` — single-entry `Save()` against the real disk-backed `TidwallStorage`. ~13ms/op — this is what an actual fsync costs, versus the microsecond-scale numbers `BenchmarkRaft_SequentialProposals` shows for the in-memory `KVStorage` it uses instead. Not a regression; a different, deliberately slower, actually-durable backend.
+- `BenchmarkTidwallStorage_SequentialRead` — 10-entry range reads against a pre-populated 10,000-entry `TidwallStorage` log under concurrent load. ~900ns/op.
+
+**A note on `TestRaft_NodeReplaysLogFromStorageOnRestart` and the two-part persistence bug it caught:** getting crash recovery actually working took two separate fixes in `NewRaftNode`, not one, and the gap between them is a good example of why storage-layer unit tests and node-level integration tests catch different things.
+
+1. `RaftNode.log` (the in-memory operational log `broadcastAppendEntriesLocked`/`checkAdvanceCommitIndexLocked`/etc. actually read from) was never populated from `storage.Entries()` on boot — it always started at just the snapshot boundary, regardless of what was durably on disk. `TestStorage_TidwallStorage_CrashReplayAndCompaction` passing the whole time didn't catch this, because it only proves the storage layer itself is correct in isolation - nothing in that test ever constructs a `RaftNode` and checks whether it actually reads storage back. Fixed by calling `storage.LastIndex()`/`storage.Entries()` in `NewRaftNode` and replaying the result via `rn.log.TruncateAndAppend`.
+2. Fixing #1 alone still wasn't enough: replaying into `rn.log` restores Raft's own bookkeeping, but the actual data lives in Layer 2 (the MVCC store), which only gets written to via `applyCh` — and nothing was re-driving that pipeline on boot for entries already committed (per the restored `HardState`) but not yet applied. `commitIndex` would correctly read `5` after a restart, `lastApplied` would still read `0`, and nothing would ever reconcile the two. Caught not by the Go-level test (which only checks `rn.log`/`commitIndex`, not the state machine) but by [`test_crash_recovery.sh`](../test_crash_recovery.sh) — write keys, `SIGKILL` all 3 nodes, restart, `GET` returned 404 for everything despite the Raft layer having correctly recovered. Fixed by calling `rn.scheduleApplyLocked()` in `NewRaftNode` whenever `commitIndex > lastApplied` after the replay.
 
 **A note on `TestRaft_InstallSnapshotToLaggingFollower` and Pre-Vote:** this test was flaky (~20% failure rate) until Pre-Vote was implemented (see [§9](#9-the-pre-vote-protocol-raft-96) below) and its final assertion changed from a single fixed sleep-then-check to a poll with a generous timeout. Root cause: while `followerID` was disconnected, it kept timing out and incrementing its own term in isolation — every attempt failed immediately since it couldn't reach anyone, but the term itself kept climbing. The instant it reconnected, if its own election timer fired before it received a heartbeat, it broadcast `RequestVote` at that inflated term, and `HandleRequestVote` adopted any higher term unconditionally — even from a candidate whose short, stale log could never actually win the vote — forcing the healthy, currently-serving Leader to step down right as it was supposed to be delivering the snapshot.
 
@@ -224,6 +233,8 @@ go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=600x -run=
 go test -bench=BenchmarkMVCC_SnapshotExport -benchmem -run='^$' ./pkg/consensus/raft/...
 go test -bench=BenchmarkMVCC_SnapshotRestore -benchmem -run='^$' ./pkg/consensus/raft/...
 go test -bench=BenchmarkRaft_LeaderElection -benchmem -run='^$' ./pkg/consensus/raft/...
+go test -bench=BenchmarkTidwallStorage_Append -benchmem -run='^$' ./pkg/consensus/raft/...
+go test -bench=BenchmarkTidwallStorage_SequentialRead -benchmem -run='^$' ./pkg/consensus/raft/...
 ```
 
 To see the consensus engine running for real rather than under simulation, build the `kv-server` daemon and run a live 3-node cluster on localhost — see [README: Run KV Server](../README.md#run-kv-server) for the exact commands and a `/status` polling loop to watch leader election and term convergence happen live.
@@ -237,7 +248,18 @@ For a scripted version of that walkthrough, run [`test_cluster.sh`](../test_clus
 It builds `kv-server`, boots a real 3-node cluster over actual TCP/HTTP (not the `SimulatedNetwork` the tests above use), and checks leader election, write replication across all three nodes, and that a follower correctly redirects writes with HTTP 307 — cleaning up all processes on exit regardless of pass/fail. See [README: Automated cluster smoke test](../README.md#automated-cluster-smoke-test) for what each of its four checks does.
 
 This category of test matters specifically because it's the only one exercising the real transport layer: the `--peers` address-parsing bug once present in `main.go` (storing the wrong split segment as each peer's address) was invisible to the in-process `SimulatedNetwork` tests above, since those never touch `TCPTransport`, `net/rpc`, or flag parsing at all.
+
+For the crash-recovery scenario specifically — does data survive if every node dies? — run [`test_crash_recovery.sh`](../test_crash_recovery.sh):
+
+```bash
+./test_crash_recovery.sh
+```
+
+It writes to a live cluster, `SIGKILL`s all three processes, restarts them from the same `data/` directories, and verifies the data and cluster are both still there. See [README: Crash-recovery smoke test](../README.md#crash-recovery-smoke-test). This is the test that caught the second of the two persistence bugs described above — `TestRaft_NodeReplaysLogFromStorageOnRestart` alone wasn't enough to catch it.
+
 ## 7. Storage Durability & Log Persistence
+
+See [milestoneTwoDurableChoice.md](milestoneTwoDurableChoice.md) for the full ADR: why a dedicated Raft WAL is kept separate from Layer 2's MVCC store, the alternatives considered, and current implementation status (both Layer 2's file snapshot and Raft's own disk WAL, `TidwallStorage`, are real and built).
 
 ### Why In-Memory Consensus Is Unsafe
 In the baseline Raft engine, state (`currentTerm`, `votedFor`, `log[]`) lives purely in volatile memory. If a node crashes and reboots:  

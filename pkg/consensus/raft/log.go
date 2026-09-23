@@ -27,11 +27,18 @@ func (l *RaftLog) toSliceIndex(raftIndex uint64) (int, bool) {
 	if raftIndex < firstIndex {
 		return 0, false // Compacted entry
 	}
-	idx := int(raftIndex - firstIndex)
-	if idx >= len(l.entries) {
+	// Bounds-check in uint64 space before converting to int: if raftIndex is
+	// ever a huge underflowed value (e.g. a caller computed nextIndex-1 with
+	// nextIndex==0), raftIndex-firstIndex is a huge uint64 whose int(...)
+	// conversion wraps around to a negative number. Checking `offset >=
+	// len(l.entries)` first guarantees offset is small enough to convert
+	// safely - a negative offset can never slip through as "in bounds" once
+	// this comparison happens in unsigned space.
+	offset := raftIndex - firstIndex
+	if offset >= uint64(len(l.entries)) {
 		return 0, false // Out of bounds
 	}
-	return idx, true
+	return int(offset), true
 }
 
 // LastIndex returns the 1-based index of the most recent entry in the log.
@@ -60,13 +67,20 @@ func (l *RaftLog) TermAt(index uint64) (uint64, bool) {
 	return l.entries[idx].Term, true
 }
 
-// Append creates and stores a new log entry at index len(entries).
+// Append creates and stores a new log entry at the next index.
 func (l *RaftLog) Append(term uint64, data []byte) LogEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// len(l.entries) alone is only the correct "next index" while
+	// entries[0].Index == 0 (nothing ever compacted). Once CompactLog has
+	// repositioned entries[0] to a snapshot boundary, the real next index is
+	// entries[0].Index + len(entries) - omitting the offset silently
+	// computes an index that's too low by entries[0].Index, e.g. Propose()
+	// returning the same index twice in a row right after the first
+	// snapshot.
 	entry := LogEntry{
-		Index: uint64(len(l.entries)),
+		Index: l.entries[0].Index + uint64(len(l.entries)),
 		Term:  term,
 		Data:  data,
 	}
@@ -81,11 +95,21 @@ func (l *RaftLog) TruncateAndAppend(prevIndex uint64, newEntries []LogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// idx is a real Raft log index; l.entries is a slice that may start at a
+	// nonzero index once compacted. Comparing/indexing idx directly against
+	// len(l.entries) (as this used to) is only valid pre-compaction - same
+	// class of bug as Append, fixed the same way: subtract entries[0].Index
+	// to convert to a slice position before touching l.entries.
+	firstIndex := l.entries[0].Index
 	for i, entry := range newEntries {
 		idx := prevIndex + 1 + uint64(i)
-		if idx < uint64(len(l.entries)) {
-			if l.entries[idx].Term != entry.Term {
-				l.entries = l.entries[:idx]
+		if idx < firstIndex {
+			continue // already compacted away; nothing to conflict-check
+		}
+		sliceIdx := idx - firstIndex
+		if sliceIdx < uint64(len(l.entries)) {
+			if l.entries[sliceIdx].Term != entry.Term {
+				l.entries = l.entries[:sliceIdx]
 				l.entries = append(l.entries, entry)
 			}
 		} else {

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -77,7 +78,38 @@ func NewRaftNode(
 	if snapMeta.LastIncludedIndex > 0 {
 		rn.log.CompactLog(snapMeta.LastIncludedIndex, snapMeta.LastIncludedTerm)
 	}
+
 	rn.mu.Lock()
+
+	// Replay entries durably persisted beyond the snapshot boundary back into
+	// the in-memory log. Without this, rn.log starts empty past the
+	// compaction horizon on every restart regardless of what's actually on
+	// disk - silently discarding every entry Save() ever wrote since the
+	// last snapshot, which defeats the point of a durable Storage backend.
+	storageLast, err := storage.LastIndex()
+	if err != nil {
+		rn.mu.Unlock()
+		return nil, fmt.Errorf("failed to read last index from storage: %w", err)
+	}
+	if storageLast > rn.log.LastIndex() {
+		entries, err := storage.Entries(rn.log.LastIndex()+1, storageLast+1, ^uint64(0))
+		if err != nil {
+			rn.mu.Unlock()
+			return nil, fmt.Errorf("failed to replay log entries from storage: %w", err)
+		}
+		rn.log.TruncateAndAppend(rn.log.LastIndex(), entries)
+	}
+
+	// Re-apply anything already committed (per the restored HardState) but
+	// not yet reflected in the state machine. The state machine (Layer 2
+	// MVCC) has no persistence of its own beyond an independent, infrequent
+	// snapshot ticker in cmd/kv-server/main.go - replaying into rn.log alone
+	// fixes Raft's own bookkeeping but silently leaves the actual data
+	// missing after a restart unless this also re-drives applyCh.
+	if rn.commitIndex > rn.lastApplied {
+		rn.scheduleApplyLocked()
+	}
+
 	rn.resetElectionTimerLocked()
 	rn.mu.Unlock()
 	go rn.eventLoop()

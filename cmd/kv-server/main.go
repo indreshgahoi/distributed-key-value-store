@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,20 +30,45 @@ type CommandPayload struct {
 	Value string `json:"value"`
 }
 
+// On-disk layout for a node's persistent state, rooted at --data-dir
+// (default "data") or overridden entirely via --node-dir:
+//
+//	data/
+//	├── node_1/                     <- nodeDir: data/node_<id>
+//	│   ├── mvcc.snap               <- Layer 2 MVCC state machine snapshot (mvcc/snapshot.go)
+//	│   └── raft_wal/               <- Raft's durable storage (TidwallStorage)
+//	│       ├── metadata.json       <- HardState{Term, Vote, Commit} + SnapshotMeta, fsync'd on every change
+//	│       ├── state.snap          <- last snapshot payload CreateSnapshot() wrote (not read back on
+//	│       │                          boot today - InitialState() only returns SnapshotMeta, not these
+//	│       │                          bytes; Layer 2 restores from mvcc.snap independently instead)
+//	│       └── segments/           <- rolling WAL segment files (tidwall/wal)
+//	├── node_2/
+//	└── node_3/
 func main() {
-	nodeID := flag.Uint64("id", 1, "Node ID (e.g. 1, 2, 3)")
+	// 1. Command-line flags - all declared before the single Parse() call below.
+	nodeID := flag.Uint64("id", 1, "Unique Node ID (e.g. 1, 2, 3)")
+	dataDir := flag.String("data-dir", "data", "Base directory for all cluster node data")
+	customNodeDir := flag.String("node-dir", "", "Explicit directory for this node (overrides data-dir/node_<id>)")
 	raftAddr := flag.String("raft-addr", "127.0.0.1:8001", "Internal Raft TCP bind address")
 	httpAddr := flag.String("http-addr", ":9001", "Public Client HTTP address")
 	peersFlag := flag.String("peers", "1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003", "Peer topology: id=host:port,...")
-
 	heartbeat := flag.Duration("heartbeat-interval", 50*time.Millisecond, "Leader heartbeat broadcast interval")
 	electionMin := flag.Duration("election-timeout-min", 150*time.Millisecond, "Minimum randomized election timeout")
 	electionMax := flag.Duration("election-timeout-max", 300*time.Millisecond, "Maximum randomized election timeout")
 	rpcTimeout := flag.Duration("rpc-timeout", 500*time.Millisecond, "Outbound RPC timeout deadline")
-
 	flag.Parse()
 
-	// 1. Parse peer cluster topology
+	// 2. Resolve and create this node's data directory.
+	nodeDir := *customNodeDir
+	if nodeDir == "" {
+		nodeDir = filepath.Join(*dataDir, fmt.Sprintf("node_%d", *nodeID))
+	}
+	if err := os.MkdirAll(nodeDir, 0755); err != nil {
+		log.Fatalf("[Node %d] Failed to create node directory %s: %v", *nodeID, nodeDir, err)
+	}
+	log.Printf("[Node %d] Using data directory: %s", *nodeID, nodeDir)
+
+	// 3. Parse peer cluster topology.
 	peerMap := make(map[uint64]string)
 	var peerIDs []uint64
 	for _, part := range strings.Split(*peersFlag, ",") {
@@ -53,6 +80,7 @@ func main() {
 		}
 	}
 
+	// 4. Build and validate the Raft configuration.
 	cfg := raft.Config{
 		NodeID:             *nodeID,
 		Peers:              peerIDs,
@@ -61,31 +89,42 @@ func main() {
 		ElectionTimeoutMax: *electionMax,
 		RPCTimeout:         *rpcTimeout,
 	}
-
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("[Node %d] Configuration validation error: %v", *nodeID, err)
 	}
 
-	// 2. Initialize Layer 2 MVCC User Data Store
-	rawEngine := raw.NewSkipListEngine(32 * 1024 * 1024)
-	store := mvcc.NewStore(rawEngine)
+	// 5. Resolve on-disk paths for this node's persistent state.
+	snapPath := filepath.Join(nodeDir, "mvcc.snap")
+	raftDir := filepath.Join(nodeDir, "raft_wal")
+
+	// 6. Initialize Layer 2: MVCC store (in-memory SkipList + periodic disk snapshot).
+	mvccEngine := raw.NewSkipListEngine(32 * 1024 * 1024)
+	store := mvcc.NewStore(mvccEngine)
 	defer store.Close()
 
-	// On Startup: Restore Layer 2 state from local snapshot file if present
-	snapPath := fmt.Sprintf("data_node%d.snap", *nodeID)
-	if err := store.LoadSnapshotFromFile(snapPath); err != nil {
-		log.Printf("[Node %d] No existing snapshot loaded: %v", *nodeID, err)
+	// LoadSnapshotFromFile returns nil both when snapPath doesn't exist (fresh
+	// start) and when it loads successfully - the two can't be told apart
+	// from its error alone. Check existence first so the log line is
+	// accurate, and so a real load failure (corruption, permissions) on a
+	// file that does exist is treated as fatal instead of silently logged
+	// as "starting fresh" and continuing with an empty store.
+	if _, statErr := os.Stat(snapPath); statErr == nil {
+		if err := store.LoadSnapshotFromFile(snapPath); err != nil {
+			log.Fatalf("[Node %d] Failed to load existing snapshot from %s: %v", *nodeID, snapPath, err)
+		}
+		log.Printf("[Node %d] Successfully restored snapshot from %s", *nodeID, snapPath)
+	} else {
+		log.Printf("[Node %d] No existing snapshot found at %s. Starting fresh.", *nodeID, snapPath)
 	}
 
-	// 3. Initialize Pluggable Raft KV Storage Engine
-	raftRawEngine := raw.NewSkipListEngine(16 * 1024 * 1024)
-	raftStorage, err := raft.NewKVStorage(raftRawEngine)
+	// 7. Initialize Raft's durable storage (tidwall/wal-backed segmented log).
+	raftStorage, err := raft.NewTidwallStorage(raftDir)
 	if err != nil {
-		log.Fatalf("[Node %d] Failed to initialize Raft KVStorage: %v", *nodeID, err)
+		log.Fatalf("[Node %d] Failed to initialize TidwallStorage at %s: %v", *nodeID, raftDir, err)
 	}
 	defer raftStorage.Close()
 
-	// 4. Initialize Raft Consensus Node
+	// 8. Initialize the Raft consensus node.
 	applyCh := make(chan raft.ApplyMsg, 1000)
 	transport := raft.NewTCPTransport(peerMap)
 	node, err := raft.NewRaftNode(cfg, transport, raftStorage, applyCh)
@@ -94,16 +133,16 @@ func main() {
 	}
 	defer node.Stop()
 
-	// 5. Start internal Raft TCP RPC Listener
+	// 9. Start the internal Raft TCP RPC listener.
 	if err := raft.StartServer(*raftAddr, node); err != nil {
 		log.Fatalf("[Node %d] Failed to start Raft TCP listener: %v", *nodeID, err)
 	}
 	log.Printf("[Node %d] Consensus engine running on %s", *nodeID, *raftAddr)
 
-	// 6. Background State Machine Applier
+	// 10. Background state-machine applier.
 	go func() {
 		for msg := range applyCh {
-			// Handle snapshot installations from Leader
+			// Snapshot installations from the Leader (InstallSnapshot RPC).
 			if !msg.CommandValid {
 				if err := store.RestoreSnapshot(bytes.NewReader(msg.Command)); err != nil {
 					log.Printf("[State Machine] Failed to restore snapshot at index %d: %v", msg.CommandIndex, err)
@@ -113,7 +152,7 @@ func main() {
 				continue
 			}
 
-			// Handle regular committed client commands
+			// Regular committed client commands.
 			var cmd CommandPayload
 			if err := json.Unmarshal(msg.Command, &cmd); err != nil {
 				log.Printf("Failed to unmarshal command at index %d: %v", msg.CommandIndex, err)
@@ -132,16 +171,17 @@ func main() {
 		}
 	}()
 
-	// 7. Periodic State Machine Snapshot & Raft Log Compaction Loop
+	// 11. Periodic state-machine snapshot & Raft log compaction loop.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			watermark := uint64(time.Now().UnixNano())
-			// A. Persist snapshot file to disk
+
+			// A. Persist Layer 2's snapshot file to disk.
 			_ = store.SaveSnapshotToFile(snapPath, watermark)
 
-			// B. Handshake with Raft to compact log up to lastApplied
+			// B. Hand the snapshot to Raft so it can compact its own log.
 			lastApplied := node.LastApplied()
 			if lastApplied > 0 {
 				var snapBuf bytes.Buffer
@@ -152,7 +192,7 @@ func main() {
 		}
 	}()
 
-	// 8. Public HTTP Client API Handlers
+	// 12. Public HTTP client API.
 	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

@@ -7,7 +7,7 @@ A distributed, transactional key-value database built from scratch in Go, layer 
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Local MVCC Storage Engine (Single Node) | ✅ Done |
-| 2 | Single Group Raft Consensus | 🚧 In progress |
+| 2 | Single Group Raft Consensus | ✅ Done |
 | 3 | Multi-Raft and Range Sharding | ⬜ Not started |
 | 4 | Hybrid Logical Clock (HLC) | ⬜ Not started |
 | 5 | Multi-Range 2PC (Percolator Model) | ⬜ Not started |
@@ -45,8 +45,8 @@ Design notes for this milestone: [docs/milestoneOne.md](docs/milestoneOne.md).
   - [x] Async `applyCh` decouples consensus from MVCC state-machine application
 - [x] **Network transport** (`pkg/consensus/raft/transport.go`): TCP RPC via `net/rpc`, per-peer connection reuse
 - [x] **Node daemon** (`cmd/kv-server`): HTTP client API (`/put`, `/get`, `/status`) fronting a Raft-replicated MVCC store
-- [x] **Log persistence — interface & write path** (`pkg/consensus/raft/storage.go`): pluggable `Storage` interface; `KVStorage` calls `Save()` at every point Raft §5.2 requires (before granting a vote, before a real election, on every `AppendEntries`) — but see the caveat below
-  - [ ] **Actual crash durability**: `KVStorage` currently sits on Layer 0's `raw.SkipListEngine`, which is in-memory only (no on-disk backend — see the Layer 0 checklist above). So today, if a node's process dies, `Save()`'s writes die with it; a restart comes back with `Term=0, Vote=0`, a fresh empty log, and no memory of ever having voted. The interface is correctly shaped for real durability (matches etcd/raft's own storage abstraction), but needs a disk-backed `raw.ByteEngine` underneath before that's actually true. Details: [docs/milestoneTwo.md §7](docs/milestoneTwo.md#7-storage-durability--log-persistence)
+- [x] **Log persistence — interface & write path** (`pkg/consensus/raft/storage.go`): pluggable `Storage` interface; every implementation calls `Save()` at every point Raft §5.2 requires (before granting a vote, before a real election, on every `AppendEntries`)
+- [x] **Log persistence — real crash durability** (`pkg/consensus/raft/storage_tidwall.go`): `TidwallStorage` persists log entries via `tidwall/wal` (fsync'd, segmented, `O(1)` truncation) and `HardState` via a separately fsync'd `metadata.json` — see the ADR at [docs/milestoneTwoDurableChoice.md](docs/milestoneTwoDurableChoice.md) for why the two are split. `NewRaftNode` replays everything durably persisted beyond the snapshot boundary back into the in-memory log *and* re-drives the state machine apply pipeline on boot, so a restart doesn't just restore Raft's bookkeeping while silently leaving Layer 2 empty. End-to-end verified by [`test_crash_recovery.sh`](test_crash_recovery.sh): write, `SIGKILL` all 3 nodes, restart, confirm the data (and cluster usability) survived.
 - [x] **Snapshotting & log compaction**: `RaftNode.Snapshot` compacts the in-memory and persisted log once Layer 2 checkpoints; `InstallSnapshot` RPC catches up a follower whose required entries were already compacted away
 
 Design notes and the full test-case catalog: [docs/milestoneTwo.md](docs/milestoneTwo.md).
@@ -74,7 +74,11 @@ distributed-key-value-store/
 │   │       ├── raft_snapshot_bench_test.go # ✅ MVCC snapshot export/restore benchmarks
 │   │       ├── storage_test.go             # ✅ KVStorage persistence & compaction test
 │   │       ├── raft_prevote_test.go        # ✅ Pre-Vote: no term inflation while isolated, stable leader survives reconnect
-│   │       └── raft_prevote_bench_test.go  # ✅ Leader-election latency benchmark
+│   │       ├── raft_prevote_bench_test.go  # ✅ Leader-election latency benchmark
+│   │       ├── storage_tidwall.go          # ✅ TidwallStorage: real disk-backed Storage (tidwall/wal + fsync'd metadata.json)
+│   │       ├── storage_tidwall_test.go     # ✅ Crash-replay, conflict-truncation, O(1) compaction test
+│   │       ├── storage_tidwall_bench_test.go # ✅ Append & sequential-read benchmarks
+│   │       └── raft_persistence_test.go    # ✅ RaftNode actually replays storage into rn.log + re-applies to Layer 2 on boot
 │   │
 │   ├── storage/
 │   │   ├── raw/                   # ✅ Layer 0: raw ordered byte storage engine
@@ -117,7 +121,10 @@ go build ./...
 ```bash
 go build -o kv-server ./cmd/kv-server
 ```
-### RUN KV SERVER
+### Run the KV server
+
+Each node persists its state under `data/node_<id>/` by default (`--data-dir` to change the base, or `--node-dir` to override the path entirely) — see [docs/milestoneTwoDurableChoice.md](docs/milestoneTwoDurableChoice.md) for the on-disk layout.
+
 Terminal 1
 ```bash
 ./kv-server \
@@ -129,6 +136,7 @@ Terminal 1
   --election-timeout-min=120ms \
   --election-timeout-max=240ms
 ```
+
 Terminal 2
 ```bash
 ./kv-server \
@@ -176,7 +184,17 @@ What it checks, in order:
 3. **Replication** — `GET /get` on all three ports and asserts every node returns the same written value.
 4. **Follower redirect** — `POST /put` on a follower and asserts it's rejected with HTTP `307` (not the leader, so it must not accept writes).
 
-It always cleans up after itself (`trap cleanup EXIT`): kills all three background server processes and removes the built binary, even if an assertion fails partway through and the script exits early via `set -e`.
+It always cleans up after itself (`trap cleanup EXIT`): kills all three background server processes and removes the built binary and `data/` directory, even if an assertion fails partway through and the script exits early via `set -e`.
+
+### Crash-recovery smoke test
+
+[`test_crash_recovery.sh`](test_crash_recovery.sh) is the direct answer to "if all my nodes die, can the data survive?" It writes to a live 3-node cluster, `SIGKILL`s all three processes (no graceful shutdown — simulating a real crash), restarts them from the same on-disk `data/` directories, and verifies the data and cluster are still there.
+
+```bash
+./test_crash_recovery.sh
+```
+
+Deliberately does **not** wait for the 30-second snapshot ticker — recovery here depends entirely on Raft's WAL replay on boot (see the checklist entry above), which is the path that covers everything written since the last snapshot and matters most in practice.
 
 This is a smoke test, not a substitute for `pkg/consensus/raft`'s test suite — it has no partition/failover coverage and only checks the happy path over a real network stack. Its value is specifically that it exercises the parts the in-process simulated-network tests can't: the actual `cmd/kv-server` binary, its flag parsing, the real `TCPTransport`/`net/rpc` wiring, and the HTTP client API — which is exactly where the peer-address bug (main.go's `--peers` parsing) and the heartbeat-interval unit bug were originally found.
 
@@ -201,6 +219,8 @@ go test -bench=BenchmarkRaft_ConcurrentProposals -benchmem -benchtime=600x -run=
 go test -bench=BenchmarkMVCC_SnapshotExport -benchmem -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkMVCC_SnapshotRestore -benchmem -run='^$' -v ./pkg/consensus/raft/...
 go test -bench=BenchmarkRaft_LeaderElection -benchmem -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkTidwallStorage_Append -benchmem -run='^$' -v ./pkg/consensus/raft/...
+go test -bench=BenchmarkTidwallStorage_SequentialRead -benchmem -run='^$' -v ./pkg/consensus/raft/...
 ```
 
 Raft-specific test-case catalog (what each test verifies) and a from-first-principles Raft primer: [docs/milestoneTwo.md](docs/milestoneTwo.md#6-testing--verification).
@@ -220,6 +240,8 @@ Benchmark baselines are committed under [bench/](bench/) so throughput and alloc
 | mvcc — snapshot export | ~1.3 ms/op, ~1.37 MB/op (streaming 10,000 live keys) | [bench/BenchmarkMVCC_SnapshotExport.txt](bench/BenchmarkMVCC_SnapshotExport.txt) |
 | mvcc — snapshot restore | ~11 ms/op, ~68 MB/op (replaying 10,000 keys into a fresh store) | [bench/BenchmarkMVCC_SnapshotRestore.txt](bench/BenchmarkMVCC_SnapshotRestore.txt) |
 | raft — leader election | ~95 ms/op (time-to-first-leader on a fresh cluster, incl. the Pre-Vote round-trip) | [bench/BenchmarkRaft_LeaderElection.txt](bench/BenchmarkRaft_LeaderElection.txt) |
+| raft — WAL append (fsync'd) | ~13 ms/op (real disk fsync per `Save()` call — vs. microseconds for the old in-memory `KVStorage`) | [bench/BenchmarkTidwallStorage_Append.txt](bench/BenchmarkTidwallStorage_Append.txt) |
+| raft — WAL sequential read | ~900 ns/op (10-entry range read under concurrent load) | [bench/BenchmarkTidwallStorage_SequentialRead.txt](bench/BenchmarkTidwallStorage_SequentialRead.txt) |
 
 Layer 2's `Get` isn't zero-allocation like the layers below it — it allocates a seek-key buffer, a key-decode scratch buffer, and clones the returned payload to protect the caller from the storage engine's internal memory. That's expected at this layer, not a regression.
 
