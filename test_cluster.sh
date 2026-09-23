@@ -53,7 +53,7 @@ WRITE_RES=$(curl -s -X POST "http://localhost:${LEADER_PORT}/put" \
   -H "Content-Type: application/json" \
   -d '{"key":"test:balance","value":"₹1000"}')
 
-if [[ "$WRITE_RES" != *"\"status\":\"proposed\""* ]]; then
+if [[ "$WRITE_RES" != *"\"status\":\"committed\""* ]]; then
   echo "FAIL: Write proposal rejected: $WRITE_RES"
   exit 1
 fi

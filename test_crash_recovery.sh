@@ -26,7 +26,7 @@ cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill -9 "$pid" 2>/dev/null || true
   done
-  pkill -9 -f './kv-server' 2>/dev/null || true # belt and suspenders
+  pkill -9 -f '^\./kv-server ' 2>/dev/null || true # belt and suspenders
   rm -f kv-server n1.log n2.log n3.log
   rm -rf data
 }
@@ -77,7 +77,7 @@ for i in 1 2 3 4 5; do
   res=$(curl -s -X POST "http://localhost:${LEADER_PORT}/put" \
     -H "Content-Type: application/json" \
     -d "{\"key\":\"crash_test_key_${i}\",\"value\":\"value_${i}\"}")
-  if [[ "$res" != *"\"status\":\"proposed\""* ]]; then
+  if [[ "$res" != *"\"status\":\"committed\""* ]]; then
     echo "FAIL: write $i rejected: $res"
     exit 1
   fi
@@ -142,7 +142,7 @@ echo "==> Phase 6: Verifying the recovered cluster still accepts and replicates 
 res=$(curl -s -X POST "http://localhost:${NEW_LEADER_PORT}/put" \
   -H "Content-Type: application/json" \
   -d '{"key":"post_crash_key","value":"still_alive"}')
-if [[ "$res" != *"\"status\":\"proposed\""* ]]; then
+if [[ "$res" != *"\"status\":\"committed\""* ]]; then
   echo "FAIL: post-restart write rejected: $res"
   exit 1
 fi

@@ -91,7 +91,15 @@ func (l *RaftLog) Append(term uint64, data []byte) LogEntry {
 // TruncateAndAppend enforces the Raft Log Matching Invariant:
 // If an existing entry conflicts with a new one (same index, different terms),
 // it deletes the existing entry and all that follow it, then appends the new entries.
-func (l *RaftLog) TruncateAndAppend(prevIndex uint64, newEntries []LogEntry) {
+//
+// It returns the suffix of newEntries that was actually written - everything
+// from the first conflicting or previously-absent index onward - or nil if
+// every entry was already present. Callers must persist exactly that suffix:
+// Storage.Save replaces the durable log from entries[0].Index onward, so
+// handing it the raw newEntries of a stale, reordered AppendEntries (an
+// already-matching prefix) would truncate acknowledged entries on disk that
+// this function correctly kept in memory.
+func (l *RaftLog) TruncateAndAppend(prevIndex uint64, newEntries []LogEntry) []LogEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -107,15 +115,15 @@ func (l *RaftLog) TruncateAndAppend(prevIndex uint64, newEntries []LogEntry) {
 			continue // already compacted away; nothing to conflict-check
 		}
 		sliceIdx := idx - firstIndex
-		if sliceIdx < uint64(len(l.entries)) {
-			if l.entries[sliceIdx].Term != entry.Term {
-				l.entries = l.entries[:sliceIdx]
-				l.entries = append(l.entries, entry)
-			}
-		} else {
-			l.entries = append(l.entries, entry)
+		if sliceIdx < uint64(len(l.entries)) && l.entries[sliceIdx].Term == entry.Term {
+			continue // already present; a duplicate or reordered RPC must not truncate
 		}
+		// First conflict (or first index past our tail): everything from
+		// here on is replaced by the rest of newEntries.
+		l.entries = append(l.entries[:sliceIdx], newEntries[i:]...)
+		return newEntries[i:]
 	}
+	return nil
 }
 
 // Slice returns a copy of log entries starting from fromIndex to the end.

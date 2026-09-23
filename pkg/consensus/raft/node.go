@@ -33,6 +33,12 @@ type RaftNode struct {
 	lastSnapshotTerm  uint64
 	snapshotData      []byte
 
+	// Apply pipeline: applyQueue (guarded by mu) is drained, in order, by the
+	// single applyLoop goroutine - the only writer to applyCh. applyNotify
+	// (cap 1) wakes it without ever blocking the consensus path.
+	applyQueue  []ApplyMsg
+	applyNotify chan struct{}
+
 	// Channles & Timers
 	applyCh        chan<- ApplyMsg
 	lastHeartBeat  time.Time
@@ -69,6 +75,7 @@ func NewRaftNode(
 		nextIndex:         make(map[uint64]uint64),
 		matchIndex:        make(map[uint64]uint64),
 		applyCh:           applyCh,
+		applyNotify:       make(chan struct{}, 1),
 		lastHeartBeat:     time.Now(),
 		heartBeatTimer:    time.NewTicker(cfg.HeartbeatInterval),
 		stopCh:            make(chan struct{}),
@@ -112,6 +119,7 @@ func NewRaftNode(
 
 	rn.resetElectionTimerLocked()
 	rn.mu.Unlock()
+	go rn.applyLoop()
 	go rn.eventLoop()
 	return rn, nil
 
@@ -536,8 +544,12 @@ func (rn *RaftNode) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEn
 	if term, ok := rn.log.TermAt(args.PrevLogIndex); ok && term != args.PrevLogTerm {
 		return
 	}
-	rn.log.TruncateAndAppend(args.PrevLogIndex, args.Entries)
-	_ = rn.storage.Save(HardState{Term: rn.currentTerm, Vote: rn.votedFor, Commit: rn.commitIndex}, args.Entries)
+	// Persist only what TruncateAndAppend actually wrote, never the raw
+	// args.Entries: Save replaces the durable log from entries[0].Index
+	// onward, so a stale, reordered RPC whose entries we already hold would
+	// otherwise truncate acknowledged entries on disk.
+	written := rn.log.TruncateAndAppend(args.PrevLogIndex, args.Entries)
+	_ = rn.storage.Save(HardState{Term: rn.currentTerm, Vote: rn.votedFor, Commit: rn.commitIndex}, written)
 	reply.Success = true
 	if args.LeaderCommit > rn.commitIndex {
 		lastNewIndex := args.PrevLogIndex + uint64(len(args.Entries))
@@ -582,15 +594,14 @@ func (rn *RaftNode) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *Inst
 		rn.lastApplied = args.LastIncludedIndex
 	}
 
-	// Deliver snapshot to the state machine
-	go func(cmd []byte, idx, term uint64) {
-		rn.applyCh <- ApplyMsg{
-			CommandValid: false, // Snapshot marker
-			CommandIndex: idx,
-			CommandTerm:  term,
-			Command:      cmd,
-		}
-	}(args.Data, args.LastIncludedIndex, args.LastIncludedTerm)
+	// Deliver snapshot to the state machine through the same ordered queue as
+	// commands, so it can never overtake entries committed before it.
+	rn.enqueueApplyLocked(ApplyMsg{
+		CommandValid: false, // Snapshot marker
+		CommandIndex: args.LastIncludedIndex,
+		CommandTerm:  args.LastIncludedTerm,
+		Command:      args.Data,
+	})
 }
 
 // checkAdvanceCommitIndexLocked enforces Raft Figure 8:
@@ -620,8 +631,8 @@ func (rn *RaftNode) checkAdvanceCommitIndexLocked() {
 	}
 }
 
-// scheduleApplyLocked extracts committed entries under lock and pushes them
-// to applyCh asynchronously to avoid blocking the consensus engine on disk/state machine operations.
+// scheduleApplyLocked extracts committed entries under lock and queues them
+// for applyLoop, so the consensus engine never blocks on a slow state machine.
 func (rn *RaftNode) scheduleApplyLocked() {
 	var toApply []ApplyMsg
 	for rn.commitIndex > rn.lastApplied {
@@ -638,12 +649,46 @@ func (rn *RaftNode) scheduleApplyLocked() {
 		}
 	}
 
-	if len(toApply) > 0 {
-		go func(msgs []ApplyMsg) {
-			for _, m := range msgs {
-				rn.applyCh <- m
+	rn.enqueueApplyLocked(toApply...)
+}
+
+// enqueueApplyLocked appends msgs to the apply queue in log order and wakes
+// applyLoop. It used to spawn a goroutine per batch, which let the Go
+// scheduler reorder batches (and InstallSnapshot deliveries) on applyCh.
+// Invariant: Caller must hold rn.mu.
+func (rn *RaftNode) enqueueApplyLocked(msgs ...ApplyMsg) {
+	if len(msgs) == 0 {
+		return
+	}
+	rn.applyQueue = append(rn.applyQueue, msgs...)
+	select {
+	case rn.applyNotify <- struct{}{}:
+	default: // a wakeup is already pending; applyLoop will see these msgs too
+	}
+}
+
+// applyLoop is the sole sender on applyCh, delivering queued messages
+// strictly in the order they were enqueued.
+func (rn *RaftNode) applyLoop() {
+	for {
+		select {
+		case <-rn.stopCh:
+			return
+		case <-rn.applyNotify:
+		}
+
+		rn.mu.Lock()
+		msgs := rn.applyQueue
+		rn.applyQueue = nil
+		rn.mu.Unlock()
+
+		for _, m := range msgs {
+			select {
+			case rn.applyCh <- m:
+			case <-rn.stopCh:
+				return
 			}
-		}(toApply)
+		}
 	}
 }
 

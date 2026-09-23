@@ -39,3 +39,34 @@ func TestRaftLog_Slice_HugeIndexReturnsNilNotPanic(t *testing.T) {
 		t.Fatalf("expected Slice(%d) to return nil for an out-of-range index, got %v", hugeIndex, res)
 	}
 }
+
+// TestRaftLog_TruncateAndAppend_ReturnsOnlyWrittenSuffix pins down the
+// contract HandleAppendEntries relies on to persist safely: the return value
+// is exactly what must be handed to Storage.Save.
+func TestRaftLog_TruncateAndAppend_ReturnsOnlyWrittenSuffix(t *testing.T) {
+	l := NewRaftLog()
+	l.TruncateAndAppend(0, makeEntries(1, 5, 1))
+
+	// Already-matching prefix (duplicate / reordered RPC): nothing written.
+	if got := l.TruncateAndAppend(0, makeEntries(1, 2, 1)); got != nil {
+		t.Fatalf("matching prefix: expected nil, got %d entries", len(got))
+	}
+	if l.LastIndex() != 5 {
+		t.Fatalf("matching prefix must not truncate: expected LastIndex 5, got %d", l.LastIndex())
+	}
+
+	// Overlap then extend: only the new tail (6..7) is written.
+	got := l.TruncateAndAppend(3, makeEntries(4, 7, 1))
+	if len(got) != 2 || got[0].Index != 6 {
+		t.Fatalf("overlap+extend: expected suffix starting at 6 of length 2, got %+v", got)
+	}
+
+	// Conflict at 5: written suffix starts at the conflict, tail is dropped.
+	got = l.TruncateAndAppend(3, append(makeEntries(4, 4, 1), makeEntries(5, 5, 2)...))
+	if len(got) != 1 || got[0].Index != 5 || got[0].Term != 2 {
+		t.Fatalf("conflict: expected single entry {5, term 2}, got %+v", got)
+	}
+	if l.LastIndex() != 5 {
+		t.Fatalf("conflict: expected LastIndex 5 after truncation, got %d", l.LastIndex())
+	}
+}

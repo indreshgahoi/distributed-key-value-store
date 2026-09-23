@@ -51,8 +51,10 @@ type Storage interface {
 	InitialState() (HardState, SnapshotMeta, error)
 
 	// Save atomically persists HardState and appends new log entries in a single atomic commit.
-	// If any incoming entry conflicts with an existing entry, storage must truncate all
-	// existing entries starting from the first conflicting entry's index.
+	// entries replace the durable log from entries[0].Index onward: any existing entry at or
+	// after that index is discarded, regardless of its term. Conflict detection is the
+	// caller's job (RaftLog.TruncateAndAppend returns exactly the suffix to pass here) -
+	// passing an already-matching prefix would truncate acknowledged entries.
 	Save(hs HardState, entries []LogEntry) error
 
 	// Entries returns a continuous slice of log entries in the range [low, high).
