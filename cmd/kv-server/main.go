@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft"
+	"github.com/indreshgahoi/distributed-key-value-store/pkg/replica"
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/storage/mvcc"
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/storage/raw"
 )
@@ -61,8 +62,8 @@ func run(cfg serverConfig) error {
 		return err
 	}
 
-	proposals := NewProposalTracker()
-	sm := &stateMachine{store: store, node: node, proposals: proposals, snapshotEvery: cfg.snapshotEvery}
+	proposals := replica.NewProposalTracker()
+	sm := replica.New(replica.Config{Store: store, Node: node, Proposals: proposals, SnapshotEvery: cfg.snapshotEvery})
 	smErr := make(chan error, 1)
 	go func() { smErr <- sm.Run(applyCh) }()
 

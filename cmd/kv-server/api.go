@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/consensus/raft"
+	"github.com/indreshgahoi/distributed-key-value-store/pkg/replica"
 	"github.com/indreshgahoi/distributed-key-value-store/pkg/storage/mvcc"
 )
 
@@ -34,7 +35,7 @@ const (
 type api struct {
 	node      *raft.RaftNode
 	store     *mvcc.Store
-	proposals *ProposalTracker
+	proposals *replica.ProposalTracker
 	httpPeers map[uint64]string
 }
 
@@ -52,7 +53,7 @@ func (a *api) handlePut(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	a.replicate(w, r, Command{Op: OpPut, Key: req.Key, Value: req.Value})
+	a.replicate(w, r, replica.Command{Op: replica.OpPut, Key: req.Key, Value: req.Value})
 }
 
 func (a *api) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -60,12 +61,12 @@ func (a *api) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	a.replicate(w, r, Command{Op: OpDelete, Key: req.Key})
+	a.replicate(w, r, replica.Command{Op: replica.OpDelete, Key: req.Key})
 }
 
 // replicate proposes cmd and responds once it is applied - never earlier,
 // because until then a leadership change could still discard it.
-func (a *api) replicate(w http.ResponseWriter, r *http.Request, cmd Command) {
+func (a *api) replicate(w http.ResponseWriter, r *http.Request, cmd replica.Command) {
 	if cmd.Key == "" {
 		writeError(w, http.StatusBadRequest, "key is required")
 		return
@@ -80,7 +81,7 @@ func (a *api) replicate(w http.ResponseWriter, r *http.Request, cmd Command) {
 	select {
 	case err := <-result:
 		switch {
-		case errors.Is(err, ErrProposalSuperseded):
+		case errors.Is(err, replica.ErrProposalSuperseded):
 			writeError(w, http.StatusConflict, err.Error())
 		case err != nil:
 			writeError(w, http.StatusBadRequest, err.Error())
