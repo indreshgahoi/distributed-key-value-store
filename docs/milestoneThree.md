@@ -67,3 +67,46 @@ There can be zero gaps and zero overlaps anywhere in the database.
 Given an arbitrary search key $K$, the router executes a binary search over the sorted slice of ranges. A key matches $\text{Range}_i$ if and only if:
 
 $$StartKey_i \le K < EndKey_i$$
+
+## 3.2 The Architectural Problem Phase 3.2 Solves
+If a node hosts 500 ranges, you cannot open 500 different TCP ports on the server (:8001, :8002... :8500).
+A physical node must listen on one single TCP port and multiplex/demultiplex all consensus traffic:
+
+- Outbound Multiplexing: Outbound RPCs wrap the request with a RangeID.
+- Inbound Demultiplexing: When a message arrives on :8001, the node inspects RangeID and routes the RPC directly to that range's local RaftNode.
+- Zero Changes to Milestone 2: Using the Adapter Pattern, each RaftNode still believes it is a standard single-group consensus node. pkg/consensus/raft does not require a single line of modification.
+```text
+                            Client Request: Put("apple", "v1")
+                                             │
+                                             ▼
+                               [ MultiRaftNode on Node 1 ]
+                                             │
+                       FindRange("apple")    │ Resolves Range 1
+                                             ▼
+                               ┌───────────────────────────┐
+                               │ Range 1 Raft Consensus    │
+                               └───────────────────────────┘
+                                             │
+                        Outbound RPC via     │ rangeTransportAdapter (attaches RangeID: 1)
+                                             ▼
+                      [ Shared TCP Connection to Node 2 (:8002) ]
+                                             │
+                                             ▼
+                               [ MultiRaftNode on Node 2 ]
+                                             │
+                        Demux: Inbound RPC   │ Inspects RangeID: 1
+                                             ▼
+                               ┌───────────────────────────┐
+                               │ Routes to Range 1 Replica │
+                               └───────────────────────────┘
+```
+
+### Implementation notes
+
+What Phase 3.2 became once built and reviewed:
+
+- **Each range is a complete replica, not just a Raft group.** It has its own Raft node, its own MVCC store, its own state machine and its own proposal tracker (`pkg/replica`, the same code `cmd/kv-server` runs). The first version shared one store across every range on a node. Because a snapshot restore replaces its store's whole contents, installing range 1's snapshot erased range 2's data. `TestMultiRaft_RangeSnapshotRestoreIsIsolated` pins the fix.
+- **Commands use the shared, structured encoding** (`replica.Command`). The first version encoded commands as `"key:value"` and split on the last colon, which corrupted any value containing `:`.
+- **Ownership is checked at apply time.** A write that reaches a range which doesn't own its key (stale routing) is rejected identically on every replica. Once ranges can split, this check is what keeps a stale route from writing into the wrong range.
+- **The transport shares `pkg/rpcclient` with single-group Raft.** Dialing is per peer, so a dead peer delays nothing else. An error returned by a remote handler (such as "range not hosted") never closes the connection every other range's traffic depends on.
+- **Failure is isolated.** A range that can't apply a committed entry halts alone, and the node's other ranges keep serving.
