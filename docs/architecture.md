@@ -1,6 +1,6 @@
 # Architecture
 
-How the system works, why it is built this way, and how its correctness is verified. This is the document to read first; [concepts.md](concepts.md) covers the underlying theory, and the milestone docs record how each layer was designed.
+How the system works, why it is built this way, and how its correctness is verified. This is the document to read first; [faq.md](faq.md) goes deeper on the *why* in question-and-answer form, [concepts.md](concepts.md) covers the underlying theory, and the milestone docs record how each layer was designed.
 
 ## 1. The system in one picture
 
@@ -39,6 +39,8 @@ The layers, bottom up, each with one job:
 | 1 | `pkg/storage/codec` | Keys encode so byte order = (user key ascending, version descending) |
 | 2 | `pkg/storage/mvcc` | Versioned reads at a timestamp; atomic whole-store replacement |
 | Consensus | `pkg/consensus/raft` | Every node applies the same commands in the same order, and a write acknowledged to a client survives any minority of failures |
+| Replica | `pkg/replica` | The KV state machine one Raft group drives: commands applied in order by a single writer, snapshots that match the applied index, "committed" reported only once applied |
+| Sharding | `pkg/sharding` | Many independent replicas per node, one per key range, sharing one connection per peer |
 | Service | `cmd/kv-server` | Linearizable HTTP API |
 
 ## 2. Life of a write
@@ -136,7 +138,7 @@ Raft storage (`storage_tidwall.go`) is the only durable state:
 - **The base offset.** `tidwall/wal` requires an empty log to start at index 1. A follower that installs a snapshot at index *S* beyond its own log therefore starts a fresh WAL with base *S*.
 - **A format version** in the metadata makes an incompatible data directory fail fast instead of being misread.
 
-**On boot**, `NewRaftNode` delivers the stored snapshot to the state machine first, then every committed entry after it, in order. That's the same pipeline the node uses at runtime. The MVCC store starts empty, and this rebuilds it. `test_crash_recovery.sh` sends `SIGKILL` to all three nodes of a real cluster, restarts them, and checks that the data survived. Each node restores a snapshot and then replays the log.
+**On boot**, `NewRaftNode` delivers the stored snapshot to the state machine first, then every committed entry after it, in order. That's the same pipeline the node uses at runtime. The MVCC store starts empty, and this rebuilds it. `test/e2e/crash_recovery_test.sh` sends `SIGKILL` to all three nodes of a real cluster, restarts them, and checks that the data survived. Each node restores a snapshot and then replays the log.
 
 ## 6. Snapshots and memory
 
@@ -161,7 +163,7 @@ Both compactions run on the state machine goroutine, which is the store's only w
 | Regression | Every bug found gets a test that failed before its fix | `raft_regression_test.go`, `raft_safety_test.go`, `snapshot_test.go` |
 | Deterministic protocol | Figure 8, conflict hints, fail-stop, boot order, the no-op before reads | `raft_safety_test.go` |
 | **Randomized fault injection** | A 5-node cluster with message drops, delays, duplicates and lost replies, partitions (including cutting off the leader), and crash-restarts (including the leader). It checks state machine safety, election safety, and durability of acknowledged writes | `chaos_test.go` |
-| End to end | Real binaries over real TCP and HTTP, including a `SIGKILL` of every node | `test_cluster.sh`, `test_crash_recovery.sh` |
+| End to end | Real binaries over real TCP and HTTP, including a `SIGKILL` of every node | `test/e2e/cluster_test.sh`, `test/e2e/crash_recovery_test.sh` |
 
 **Proof the chaos test has teeth.** A passing randomized test proves little unless it can fail. Known bugs were injected one at a time:
 

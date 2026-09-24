@@ -3,6 +3,7 @@
 A distributed, transactional key-value database built from scratch in Go, layer by layer — each layer independently testable and providing a specific guarantee to the layer above it.
 
 - **[docs/architecture.md](docs/architecture.md)** — start here: how the system works end to end, the invariants and where each is enforced, durability and recovery, and how correctness is verified (including fault-injection testing and mutation checks that prove the tests catch real bugs).
+- [docs/faq.md](docs/faq.md) — design-review FAQ: 41 questions a senior reviewer would ask (correctness, durability, reads, verification, performance, limits), each answered with the code that implements it.
 - [docs/concepts.md](docs/concepts.md) — a from-first-principles primer on *why* each layer (replication, consensus, partitioning, MVCC, clock skew, 2PC) exists.
 
 ## Roadmap
@@ -60,7 +61,11 @@ Design notes and the original test-case catalog: [docs/milestoneTwo.md](docs/mil
   - [x] `RangeDescriptor` — range bounds, replica peers, cached leader; `Contains`/`Validate`/`Clone`
   - [x] `RangeRouter.UpdateTable` — atomically installs a new routing table, rejecting any gap or overlap in keyspace coverage
   - [x] `RangeRouter.FindRange` — `O(log N)` binary-search lookup, thread-safe for concurrent read-heavy client workloads
-- [ ] **Phase 3.2 — Multi-Raft node & RPC multiplexing** (`pkg/sharding/multi_node.go`): co-locate multiple independent Raft groups on one node
+- [x] **Phase 3.2 — Multi-Raft node & RPC multiplexing** (`pkg/sharding`): many independent range replicas on one node
+  - [x] Each range is a complete replica (`pkg/replica`): its own Raft group, store, state machine and proposal tracker — so one range's snapshot can never touch another's data, and a failing range halts alone
+  - [x] One listener and one pooled connection per node pair carry every range's RPCs (`transport.go`, `pkg/rpcclient`); an RPC for an unknown range can't tear down the shared connection
+  - [x] `Put` / `Delete` return once applied; `Get` is a linearizable per-range Read Index read; writes routed to the wrong range are rejected at apply time
+  - [x] Tested in-process and over real TCP, including a lagging node catching up via `InstallSnapshot` through the multiplexed transport
 - [ ] **Phase 3.3 — Dynamic range splitting via consensus** (`pkg/sharding/split.go`): `SplitCommand` proposed and committed through Raft
 - [ ] **Phase 3.4 — Server integration & multi-range client routing** (`cmd/kv-server`): requests to any node auto-route to the correct range leader
 
@@ -73,10 +78,7 @@ distributed-key-value-store/
 ├── cmd/kv-server/                 # Node daemon
 │   ├── main.go                    # wiring, fail-stop, graceful shutdown
 │   ├── config.go                  # flags + validation
-│   ├── api.go                     # HTTP API: /put /delete /get /status, leader redirect
-│   ├── proposals.go               # waits for a write to be *applied*, not just proposed
-│   ├── statemachine.go            # single writer: applies entries, snapshots, compacts the store
-│   └── command.go                 # replicated command format
+│   └── api.go                     # HTTP API: /put /delete /get /status, leader redirect
 ├── pkg/
 │   ├── consensus/raft/            # Milestone 2: Raft (file-by-file map in docs/architecture.md §4)
 │   │   ├── node.go                # RaftNode, recovery, event loop, persistence, fail-stop
@@ -92,13 +94,21 @@ distributed-key-value-store/
 │   │   ├── transport.go, rpc.go   # TCP RPC and message types
 │   │   ├── chaos_test.go          # randomized fault-injection test
 │   │   └── *_test.go              # unit, regression, and protocol tests
-│   ├── sharding/                  # 🚧 Milestone 3: range descriptors + O(log N) router
+│   ├── replica/                   # KV state machine run by one Raft group: command format,
+│   │                              #   single-writer applier (snapshots, compaction), proposal tracker
+│   ├── rpcclient/                 # per-peer pooled net/rpc connections, shared by all transports
+│   ├── sharding/                  # 🚧 Milestone 3
+│   │   ├── types.go, router.go    # range descriptors + O(log N) router
+│   │   ├── multi_node.go          # MultiRaftNode: per-range replicas, Put/Delete/Get routed by key
+│   │   └── transport.go           # range-tagged RPCs multiplexed over one connection per peer
 │   └── storage/
 │       ├── raw/                   # Layer 0: lock-free skiplist on an arena allocator
 │       ├── codec/                 # Layer 1: order-preserving key/value encoding
 │       └── mvcc/                  # Layer 2: versioned store, checksummed snapshots, compaction
-├── test_cluster.sh                # end-to-end smoke test over real HTTP/TCP
-└── test_crash_recovery.sh         # SIGKILL every node, restart, verify data survived
+├── test/e2e/                      # end-to-end tests against real processes (see its README)
+│   ├── cluster_test.sh            # smoke test over real HTTP/TCP
+│   └── crash_recovery_test.sh     # SIGKILL every node, restart, verify data survived
+└── Makefile                       # make test | test-race | chaos | e2e | bench | lint | ci
 ```
 
 ## Getting started
@@ -168,10 +178,10 @@ for port in 9001 9002 9003; do curl -s localhost:$port/status; done           # 
 
 ### Automated cluster smoke test
 
-[`test_cluster.sh`](test_cluster.sh) automates the manual 3-terminal walkthrough above into a single black-box script: it builds `kv-server`, boots a 3-node cluster in the background, and exercises it over real HTTP/TCP end-to-end (not the in-process simulated network the `pkg/consensus/raft` tests use).
+[`cluster_test.sh`](test/e2e/cluster_test.sh) automates the manual 3-terminal walkthrough above into a single black-box script: it builds `kv-server`, boots a 3-node cluster in the background, and exercises it over real HTTP/TCP end-to-end (not the in-process simulated network the `pkg/consensus/raft` tests use).
 
 ```bash
-./test_cluster.sh
+make e2e   # or: test/e2e/cluster_test.sh
 ```
 
 What it checks, in order:
@@ -181,14 +191,14 @@ What it checks, in order:
 4. **Linearizable reads** — served by the leader; `curl -L` via a follower follows its redirect.
 5. **Follower redirect** — `POST /put` on a follower returns `307` pointing at the leader.
 
-It always cleans up after itself (`trap cleanup EXIT`): kills all three background server processes and removes the built binary and `data/` directory, even if an assertion fails partway through and the script exits early via `set -e`.
+Each run works in its own temporary directory (binary, node data, logs) and cleans up on exit, even if an assertion fails partway through, so it never touches the working tree. `KEEP_WORK_DIR=1` keeps it for debugging.
 
 ### Crash-recovery smoke test
 
-[`test_crash_recovery.sh`](test_crash_recovery.sh) is the direct answer to "if all my nodes die, can the data survive?" It writes to a live 3-node cluster, `SIGKILL`s all three processes (no graceful shutdown — simulating a real crash), restarts them from the same on-disk `data/` directories, and verifies the data and cluster are still there.
+[`crash_recovery_test.sh`](test/e2e/crash_recovery_test.sh) is the direct answer to "if all my nodes die, can the data survive?" It writes to a live 3-node cluster, `SIGKILL`s all three processes (no graceful shutdown — simulating a real crash), restarts them over the same data directories, and verifies the data and cluster are still there.
 
 ```bash
-./test_crash_recovery.sh
+test/e2e/crash_recovery_test.sh
 ```
 
 It runs with `--snapshot-every=3`, so recovery exercises both paths: each node's empty in-memory store is rebuilt from its latest snapshot, then from the WAL entries after it.
@@ -196,6 +206,19 @@ It runs with `--snapshot-every=3`, so recovery exercises both paths: each node's
 This is a smoke test, not a substitute for `pkg/consensus/raft`'s test suite — it has no partition/failover coverage and only checks the happy path over a real network stack. Its value is specifically that it exercises the parts the in-process simulated-network tests can't: the actual `cmd/kv-server` binary, its flag parsing, the real `TCPTransport`/`net/rpc` wiring, and the HTTP client API — which is exactly where the peer-address bug (main.go's `--peers` parsing) and the heartbeat-interval unit bug were originally found.
 
 ### Run tests
+
+Each tier has one command (`make help` lists them):
+
+```bash
+make test        # unit + protocol tests, short chaos run
+make test-race   # full Go suite under the race detector
+make chaos       # fault-injection soak (CHAOS_SEEDS=10 CHAOS_SECONDS=6 by default)
+make e2e         # real processes over TCP/HTTP, incl. SIGKILL-all-nodes recovery
+make bench       # all benchmarks; compare with benchstat (bench/README.md)
+make ci          # lint + test-race + e2e
+```
+
+Unit and protocol tests live next to the code they test (`*_test.go`), as is idiomatic Go; only tests that need real processes live in [`test/e2e/`](test/e2e/). The equivalent raw commands:
 
 ```bash
 # Full unit test suite, verbose
@@ -227,7 +250,7 @@ go test -bench=BenchmarkRangeRouter_FindRange_10000Ranges -benchmem -run='^$' -v
 ```
 
 ```bash
-# Sharding (Milestone 3, Phase 3.1) — routing correctness + concurrency, in isolation
+# Sharding (Milestone 3) — routing, then multi-range replicas in-process and over TCP
 go test -v ./pkg/sharding/...
 go test -race -run TestRangeRouter_ConcurrentReadsAndUpdates ./pkg/sharding/...
 ```
@@ -247,7 +270,7 @@ Benchmark baselines are committed under [bench/](bench/) so throughput and alloc
 | raft — sequential propose | ~1.26 ms/op (full propose → quorum → commit → apply, incl. `KVStorage` persistence) | [bench/BenchmarkRaft_SequentialProposals.txt](bench/BenchmarkRaft_SequentialProposals.txt) |
 | raft — concurrent propose | ~29 µs/op under contention (capped at 600 iterations, see note) | [bench/BenchmarkRaft_ConcurrentProposals.txt](bench/BenchmarkRaft_ConcurrentProposals.txt) |
 | mvcc — snapshot export | ~0.9 ms/op (streaming 10,000 live keys, buffered + CRC-32C) | [bench/BenchmarkMVCC_SnapshotExport.txt](bench/BenchmarkMVCC_SnapshotExport.txt) |
-| mvcc — snapshot restore | ~14 ms/op (10,000 keys into a fresh engine, verified, then swapped in — replaces state rather than merging) | [bench/BenchmarkMVCC_SnapshotRestore.txt](bench/BenchmarkMVCC_SnapshotRestore.txt) |
+| mvcc — snapshot restore | ~9.3 ms/op, 68 MB/op (10,000 keys into a fresh 64 MiB engine, checksum-verified, then swapped in — replaces state rather than merging) | [bench/BenchmarkMVCC_SnapshotRestore.txt](bench/BenchmarkMVCC_SnapshotRestore.txt) |
 | raft — leader election | ~85 ms/op (time-to-first-leader on a fresh cluster, incl. the Pre-Vote round-trip) | [bench/BenchmarkRaft_LeaderElection.txt](bench/BenchmarkRaft_LeaderElection.txt) |
 | raft — WAL append (fsync'd) | ~6.4 ms/op (one fsync per `Save()`; unchanged HardState is no longer rewritten — was ~13 ms with two) | [bench/BenchmarkTidwallStorage_Append.txt](bench/BenchmarkTidwallStorage_Append.txt) |
 | raft — WAL sequential read | ~950 ns/op (10-entry range read under concurrent load) | [bench/BenchmarkTidwallStorage_SequentialRead.txt](bench/BenchmarkTidwallStorage_SequentialRead.txt) |

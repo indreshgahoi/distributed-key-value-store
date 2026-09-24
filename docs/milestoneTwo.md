@@ -211,7 +211,7 @@ Eight benchmarks measure the hot paths directly (`raft_bench_test.go`, `raft_sna
 **A note on `TestRaft_NodeReplaysLogFromStorageOnRestart` and the two-part persistence bug it caught:** getting crash recovery actually working took two separate fixes in `NewRaftNode`, not one, and the gap between them is a good example of why storage-layer unit tests and node-level integration tests catch different things.
 
 1. `RaftNode.log` (the in-memory operational log `broadcastAppendEntriesLocked`/`checkAdvanceCommitIndexLocked`/etc. actually read from) was never populated from `storage.Entries()` on boot — it always started at just the snapshot boundary, regardless of what was durably on disk. `TestStorage_TidwallStorage_CrashReplayAndCompaction` passing the whole time didn't catch this, because it only proves the storage layer itself is correct in isolation - nothing in that test ever constructs a `RaftNode` and checks whether it actually reads storage back. Fixed by calling `storage.LastIndex()`/`storage.Entries()` in `NewRaftNode` and replaying the result via `rn.log.TruncateAndAppend`.
-2. Fixing #1 alone still wasn't enough: replaying into `rn.log` restores Raft's own bookkeeping, but the actual data lives in Layer 2 (the MVCC store), which only gets written to via `applyCh` — and nothing was re-driving that pipeline on boot for entries already committed (per the restored `HardState`) but not yet applied. `commitIndex` would correctly read `5` after a restart, `lastApplied` would still read `0`, and nothing would ever reconcile the two. Caught not by the Go-level test (which only checks `rn.log`/`commitIndex`, not the state machine) but by [`test_crash_recovery.sh`](../test_crash_recovery.sh) — write keys, `SIGKILL` all 3 nodes, restart, `GET` returned 404 for everything despite the Raft layer having correctly recovered. Fixed by calling `rn.scheduleApplyLocked()` in `NewRaftNode` whenever `commitIndex > lastApplied` after the replay.
+2. Fixing #1 alone still wasn't enough: replaying into `rn.log` restores Raft's own bookkeeping, but the actual data lives in Layer 2 (the MVCC store), which only gets written to via `applyCh` — and nothing was re-driving that pipeline on boot for entries already committed (per the restored `HardState`) but not yet applied. `commitIndex` would correctly read `5` after a restart, `lastApplied` would still read `0`, and nothing would ever reconcile the two. Caught not by the Go-level test (which only checks `rn.log`/`commitIndex`, not the state machine) but by [`test/e2e/crash_recovery_test.sh`](../test/e2e/crash_recovery_test.sh) — write keys, `SIGKILL` all 3 nodes, restart, `GET` returned 404 for everything despite the Raft layer having correctly recovered. Fixed by calling `rn.scheduleApplyLocked()` in `NewRaftNode` whenever `commitIndex > lastApplied` after the replay.
 
 **A note on `TestRaft_InstallSnapshotToLaggingFollower` and Pre-Vote:** this test was flaky (~20% failure rate) until Pre-Vote was implemented (see [§9](#9-the-pre-vote-protocol-raft-96) below) and its final assertion changed from a single fixed sleep-then-check to a poll with a generous timeout. Root cause: while `followerID` was disconnected, it kept timing out and incrementing its own term in isolation — every attempt failed immediately since it couldn't reach anyone, but the term itself kept climbing. The instant it reconnected, if its own election timer fired before it received a heartbeat, it broadcast `RequestVote` at that inflated term, and `HandleRequestVote` adopted any higher term unconditionally — even from a candidate whose short, stale log could never actually win the vote — forcing the healthy, currently-serving Leader to step down right as it was supposed to be delivering the snapshot.
 
@@ -243,20 +243,20 @@ go test -bench=BenchmarkTidwallStorage_SequentialRead -benchmem -run='^$' ./pkg/
 
 To see the consensus engine running for real rather than under simulation, build the `kv-server` daemon and run a live 3-node cluster on localhost — see [README: Run KV Server](../README.md#run-kv-server) for the exact commands and a `/status` polling loop to watch leader election and term convergence happen live.
 
-For a scripted version of that walkthrough, run [`test_cluster.sh`](../test_cluster.sh) from the repo root:
+For a scripted version of that walkthrough, run [`test/e2e/cluster_test.sh`](../test/e2e/cluster_test.sh) from the repo root:
 
 ```bash
-./test_cluster.sh
+test/e2e/cluster_test.sh
 ```
 
 It builds `kv-server`, boots a real 3-node cluster over actual TCP/HTTP (not the `SimulatedNetwork` the tests above use), and checks leader election, write replication across all three nodes, and that a follower correctly redirects writes with HTTP 307 — cleaning up all processes on exit regardless of pass/fail. See [README: Automated cluster smoke test](../README.md#automated-cluster-smoke-test) for what each of its four checks does.
 
 This category of test matters specifically because it's the only one exercising the real transport layer: the `--peers` address-parsing bug once present in `main.go` (storing the wrong split segment as each peer's address) was invisible to the in-process `SimulatedNetwork` tests above, since those never touch `TCPTransport`, `net/rpc`, or flag parsing at all.
 
-For the crash-recovery scenario specifically — does data survive if every node dies? — run [`test_crash_recovery.sh`](../test_crash_recovery.sh):
+For the crash-recovery scenario specifically — does data survive if every node dies? — run [`test/e2e/crash_recovery_test.sh`](../test/e2e/crash_recovery_test.sh):
 
 ```bash
-./test_crash_recovery.sh
+test/e2e/crash_recovery_test.sh
 ```
 
 It writes to a live cluster, `SIGKILL`s all three processes, restarts them from the same `data/` directories, and verifies the data and cluster are both still there. See [README: Crash-recovery smoke test](../README.md#crash-recovery-smoke-test). This is the test that caught the second of the two persistence bugs described above — `TestRaft_NodeReplaysLogFromStorageOnRestart` alone wasn't enough to catch it.
